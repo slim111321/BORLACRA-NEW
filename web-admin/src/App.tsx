@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from './lib/supabase';
 import LiveMap from './components/LiveMap';
 import ActivityFeed from './components/ActivityFeed';
@@ -75,9 +75,13 @@ function App() {
   const [activeTicket, setActiveTicket] = useState<any>(null);
   const [supportMessages, setSupportMessages] = useState<any[]>([]);
   const [newMessage, setNewMessage] = useState('');
+  const ticketChannelRef = useRef<any>(null);
 
   const playPing = async () => {
     try {
+      if (typeof navigator !== 'undefined' && navigator.vibrate) {
+        navigator.vibrate([200, 100, 200]);
+      }
       const context = new (window.AudioContext || (window as any).webkitAudioContext)();
       if (context.state === 'suspended') {
         await context.resume();
@@ -120,6 +124,67 @@ function App() {
   const [searchQuery, setSearchQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState('ALL');
   const [selectedUserDocs, setSelectedUserDocs] = useState<any>(null);
+
+  const handleOpenKycModal = async (u: any) => {
+    let docs = kycFiles.filter(f => f.collector_id === u.id);
+    
+    // Fallback: If RLS blocked collector_documents table, pull from profiles.vehicle_details.kyc_docs
+    const vDetails = typeof u.vehicle_details === 'string' ? JSON.parse(u.vehicle_details) : (u.vehicle_details || {});
+    if (docs.length === 0 && vDetails?.kyc_docs) {
+      docs = Object.entries(vDetails.kyc_docs).map(([key, url]) => ({
+        id: key,
+        collector_id: u.id,
+        doc_type: key,
+        doc_url: url,
+        created_at: u.created_at || new Date().toISOString()
+      }));
+    }
+    
+    // Generate signed URLs dynamically to bypass private bucket 403 errors
+    const processedDocs = await Promise.all(docs.map(async (doc) => {
+      try {
+        // Extract the path from the full public URL
+        const urlToSplit = doc.doc_url || doc.document_url || '';
+        const parts = urlToSplit.split('/collector-documents/');
+        if (parts.length > 1) {
+          const path = decodeURIComponent(parts[1].split('?')[0]);
+          const { data, error } = await supabase.storage.from('collector-documents').createSignedUrl(path, 60 * 60); // 1 hour expiry
+          if (error) {
+            console.error('Signed URL Error:', error);
+            alert(`Error generating URL for ${path}: ${error.message}`);
+          }
+          if (!error && data?.signedUrl) {
+            return { ...doc, doc_url: data.signedUrl, document_url: data.signedUrl };
+          }
+        }
+      } catch (e) {
+        console.error('Error generating signed url', e);
+      }
+      return doc; // fallback to original if failed
+    }));
+
+    let processedUser = { ...u };
+    if (u.vehicle_details?.photo_url) {
+      try {
+        const vParts = u.vehicle_details.photo_url.split('/collector-documents/');
+        if (vParts.length > 1) {
+          const vPath = decodeURIComponent(vParts[1].split('?')[0]);
+          const { data, error } = await supabase.storage.from('collector-documents').createSignedUrl(vPath, 60 * 60);
+          if (error) {
+            console.error('Signed URL Error (Vehicle):', error);
+            alert(`Error generating URL for Vehicle Photo: ${error.message}`);
+          }
+          if (!error && data?.signedUrl) {
+            processedUser.vehicle_details = { ...u.vehicle_details, photo_url: data.signedUrl };
+          }
+        }
+      } catch (e) {
+        console.error('Error generating signed url for vehicle', e);
+      }
+    }
+
+    setSelectedUserDocs({ user: processedUser, docs: processedDocs });
+  };
 
   // Live Operations State
   const [collectorLocations, setCollectorLocations] = useState<any[]>([]);
@@ -177,7 +242,7 @@ function App() {
 
       const { data: kyc } = await supabase
         .from('profiles')
-        .select('*, collector_documents(document_type, created_at)')
+        .select('*, collector_documents(doc_type, created_at)')
         .eq('role', 'COLLECTOR')
         .eq('is_verified', false)
         .limit(5);
@@ -229,7 +294,11 @@ function App() {
   const fetchUserData = useCallback(async () => {
     try {
       const { data: users } = await supabase.from('profiles').select('*').order('created_at', { ascending: false });
-      const { data: docs } = await supabase.from('collector_documents').select('*');
+      // Explicitly select all columns needed for the KYC modal matching real schema
+      const { data: docs } = await supabase
+        .from('collector_documents')
+        .select('id, collector_id, doc_type, doc_url, status, created_at')
+        .order('created_at', { ascending: false });
 
       if (users) setPlatformUsers(users);
       if (docs) setKycFiles(docs);
@@ -278,10 +347,47 @@ function App() {
 
   const fetchPerformanceData = useCallback(async () => {
     try {
-      const { data: qReviews } = await supabase.from('reviews').select('*, profiles!reviews_reviewer_id_fkey(full_name), pickups(trash_type)').or('rating.lte.2,is_flagged.eq.true').order('created_at', { ascending: false });
+      // 1. Direct select from reviews without fragile foreign key joins
+      const { data: qReviews, error: revErr } = await supabase
+        .from('reviews')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (revErr) {
+        console.error("Reviews fetch error:", revErr);
+      }
+
+      let enrichedReviews: any[] = [];
+      if (qReviews) {
+        // 2. Manually enrich profiles, collector profiles, and pickups to guarantee 100% success
+        enrichedReviews = await Promise.all(qReviews.map(async (rev) => {
+          let prof = null;
+          let collProf = null;
+          let pick = null;
+          if (rev.reviewer_id) {
+            const { data: p } = await supabase.from('profiles').select('full_name').eq('id', rev.reviewer_id).maybeSingle();
+            prof = p;
+          }
+          if (rev.collector_id) {
+            const { data: cp } = await supabase.from('profiles').select('full_name, avatar_url').eq('id', rev.collector_id).maybeSingle();
+            collProf = cp;
+          }
+          if (rev.pickup_id) {
+            const { data: pk } = await supabase.from('pickups').select('trash_type').eq('id', rev.pickup_id).maybeSingle();
+            pick = pk;
+          }
+          return {
+            ...rev,
+            profiles: prof || { full_name: 'Customer' },
+            collector_profiles: collProf || { full_name: 'Collector', avatar_url: null },
+            pickups: pick || { trash_type: 'General Waste' }
+          };
+        }));
+      }
+
       const { data: metrics } = await supabase.from('collector_performance_metrics').select('*').order('performance_score', { ascending: false });
 
-      if (qReviews) setLowRatings(qReviews);
+      setLowRatings(enrichedReviews);
       if (metrics) setCollectorMetrics(metrics);
     } catch (err) {
       console.error("Performance fetch error:", err);
@@ -315,16 +421,36 @@ function App() {
     try {
       const { data, error } = await supabase
         .from('support_tickets')
-        .select('*, profiles(full_name, avatar_url)')
+        .select('*')
         .order('updated_at', { ascending: false });
-      if (error) throw error;
-      setSupportTickets(data || []);
+      
+      if (error) {
+        console.error("Support tickets fetch error:", error);
+        throw error;
+      }
+
+      let enrichedTickets: any[] = [];
+      if (data) {
+        enrichedTickets = await Promise.all(data.map(async (t) => {
+          let prof = null;
+          if (t.user_id) {
+            const { data: p } = await supabase.from('profiles').select('full_name, avatar_url').eq('id', t.user_id).maybeSingle();
+            prof = p;
+          }
+          return {
+            ...t,
+            profiles: prof || { full_name: 'Unknown User', avatar_url: null }
+          };
+        }));
+      }
+
+      setSupportTickets(enrichedTickets);
     } catch (err) {
       console.error("Support fetch error:", err);
     }
   }, []);
 
-  const handleOpenChat = async (passedId: string | undefined, fallbackId?: string) => {
+  const handleOpenChat = async (passedId: string | undefined, fallbackId?: string, incidentId?: string) => {
     const userId = passedId || fallbackId;
     if (!userId) {
       alert("Collector ID not found for this incident.");
@@ -332,27 +458,36 @@ function App() {
     }
 
     try {
-      setActiveTab('support'); 
-      
-      const { data: existing } = await supabase
+      setActiveTab('support');
+
+      // Check if there is already an open ticket for this user
+      const { data: existingTickets } = await supabase
         .from('support_tickets')
-        .select('*, profiles(full_name, avatar_url)')
+        .select('*')
         .eq('user_id', userId)
         .eq('status', 'open')
-        .maybeSingle();
+        .order('created_at', { ascending: false })
+        .limit(1);
 
-      let ticket = existing;
-      if (!ticket) {
-        // Step 1: Insert basic ticket
+      let ticket: any;
+      if (existingTickets && existingTickets.length > 0) {
+        ticket = existingTickets[0];
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('full_name, avatar_url')
+          .eq('id', userId)
+          .single();
+        ticket = { ...ticket, profiles: profile || { full_name: 'Unknown User', avatar_url: null } };
+      } else {
+        const subject = incidentId ? `Incident Follow-up #${incidentId.substring(0, 8)}` : 'Incident Follow-up';
         const { data: inserted, error: insertError } = await supabase
           .from('support_tickets')
-          .insert({ user_id: userId, subject: 'Incident Follow-up', status: 'open' })
+          .insert({ user_id: userId, subject, status: 'open' })
           .select()
           .single();
-        
+
         if (insertError) throw insertError;
 
-        // Step 2: Fetch profile separately to avoid join errors
         const { data: profile } = await supabase
           .from('profiles')
           .select('full_name, avatar_url')
@@ -360,12 +495,24 @@ function App() {
           .single();
 
         ticket = { ...inserted, profiles: profile || { full_name: 'Unknown User', avatar_url: null } };
+
+        setSupportTickets(prev => [ticket, ...prev]);
+        
+        // Broadcast to alert the collector that a new ticket was created by subscribing on the fly
+        const userAlertChan = supabase.channel(`user_alerts_${userId}`);
+        userAlertChan.subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            userAlertChan.send({
+              type: 'broadcast',
+              event: 'new_ticket',
+              payload: { ticket_id: inserted.id }
+            }).then(() => supabase.removeChannel(userAlertChan));
+          }
+        });
       }
 
-      if (ticket) {
-        setSupportTickets(prev => [ticket, ...prev.filter(t => t.id !== ticket.id)]);
-        setActiveTicket(ticket);
-      }
+      setActiveTicket(ticket);
+      setSupportMessages([]); // Clear any old messages, will be fetched by useEffect
     } catch (err) {
       console.error("Open chat error details:", err);
       const msg = (err as any).message || "Unknown error";
@@ -389,12 +536,34 @@ function App() {
         created_at: new Date().toISOString()
       }]);
 
-      const { error } = await supabase.from('support_messages').insert({
+      const { data: insertedMsg, error } = await supabase.from('support_messages').insert({
         ticket_id: activeTicket.id,
         sender_id: session.user.id,
         content: msgContent
-      });
+      }).select().single();
+      
       if (error) throw error;
+
+      // Broadcast to ensure delivery
+      if (insertedMsg) {
+        if (ticketChannelRef.current) {
+          ticketChannelRef.current.send({
+            type: 'broadcast',
+            event: 'new_message',
+            payload: insertedMsg
+          });
+        }
+        const userAlertChan = supabase.channel(`user_alerts_${activeTicket.user_id}`);
+        userAlertChan.subscribe((status) => {
+          if (status === 'SUBSCRIBED') {
+            userAlertChan.send({
+              type: 'broadcast',
+              event: 'new_message',
+              payload: insertedMsg
+            }).then(() => supabase.removeChannel(userAlertChan));
+          }
+        });
+      }
     } catch (err) {
       alert("Error sending message: " + (err as Error).message);
     }
@@ -402,62 +571,96 @@ function App() {
 
   useEffect(() => {
     if (!activeTicket) return;
-    
-    // Initial fetch
-    supabase.from('support_messages')
-      .select('*')
-      .eq('ticket_id', activeTicket.id)
-      .order('created_at', { ascending: true })
-      .then(({ data }) => setSupportMessages(data || []));
 
-    // Realtime
+    const fetchMessages = async () => {
+      const { data } = await supabase.from('support_messages')
+        .select('*')
+        .eq('ticket_id', activeTicket.id)
+        .order('created_at', { ascending: true });
+      if (data) setSupportMessages(data);
+    };
+
+    // Initial fetch
+    fetchMessages();
+
+    // Realtime — play ping when admin receives a new message from the user (Broadcast-based)
     const sub = supabase.channel(`ticket_${activeTicket.id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'support_messages', filter: `ticket_id=eq.${activeTicket.id}` }, (payload) => {
-        setSupportMessages(prev => {
-          if (prev.some(m => m.id === payload.new.id)) return prev;
-          // Filter out the temp optimistic message if it exists
-          const filtered = prev.filter(m => m.content !== payload.new.content || m.sender_id !== payload.new.sender_id || typeof m.id !== 'string' || !m.id.startsWith('0.'));
-          return [...filtered, payload.new];
-        });
+      .on('broadcast', { event: 'new_message' }, (payload) => {
+        // If the message is NOT from the admin, play alert
+        if (payload.payload?.sender_id !== session?.user?.id) {
+          playPing();
+        }
+        // Always fetch the latest state from the database to guarantee it renders
+        fetchMessages();
       })
       .subscribe();
 
-    return () => { supabase.removeChannel(sub); };
-  }, [activeTicket]);
+    ticketChannelRef.current = sub;
 
-  // Global Support Notification Listener for Admin
+    return () => { 
+      supabase.removeChannel(sub); 
+      ticketChannelRef.current = null;
+    };
+  }, [activeTicket, session?.user?.id]);
+
+  // Global Notification Listener for Admin
   useEffect(() => {
     if (!session?.user?.id) return;
 
     const sub = supabase.channel('admin_global_alerts')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'support_messages' }, (payload) => {
+      .on('broadcast', { event: 'new_message' }, (payload) => {
         console.log('[AdminAlert] New message:', payload);
-        if (payload.new.sender_id !== session.user.id) {
+        if (payload.payload.sender_id !== session.user.id) {
           playPing();
           fetchSupportTickets();
         }
       })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'incident_reports' }, (payload) => {
-        console.log('[AdminAlert] New incident:', payload);
+      .on('broadcast', { event: 'new_incident' }, (payload) => {
+        console.log('[AdminAlert] New incident broadcast:', payload);
         playPing();
         fetchIncidents();
+        // Show a browser notification if supported
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('🚨 New Incident Report', { body: `${payload.payload.type?.replace(/_/g, ' ')}: ${payload.payload.description || ''}` });
+        }
+      })
+      .on('broadcast', { event: 'new_critical_review' }, (payload) => {
+        console.log('[AdminAlert] New critical review broadcast:', payload);
+        playPing();
+        fetchPerformanceData();
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('⚠️ Critical Review / Flag', { body: `Rating: ⭐${payload.payload.rating} - "${payload.payload.comment || ''}"` });
+        }
+      })
+      .on('broadcast', { event: 'rating_submitted' }, (payload) => {
+        console.log('[AdminAlert] New rating submitted broadcast:', payload);
+        playPing();
+        fetchPerformanceData();
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('⭐ New Collector Rating', { body: `Rating: ⭐${payload.payload.rating} - "${payload.payload.comment || ''}"` });
+        }
+      })
+      .on('broadcast', { event: 'sos_emergency' }, (payload) => {
+        console.log('[AdminAlert] SOS Emergency broadcast:', payload);
+        playPing();
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('🚨 SOS EMERGENCY ACTIVATED', { body: `Collector: ${payload.payload.full_name || 'Collector'} (${payload.payload.phone || 'No phone'})` });
+        }
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'broadcasts' }, (payload) => {
-        console.log('[AdminAlert] New broadcast:', payload);
+        console.log('[AdminAlert] New broadcast sent:', payload.new.message);
         playPing();
+        fetchBroadcastData();
+      })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'collector_documents' }, (payload) => {
+        console.log('[AdminAlert] New KYC document uploaded:', payload);
+        playPing();
+        fetchUserData(); // Refresh so admin can see the new doc immediately
       })
       .subscribe();
 
-    const broadcastSub = supabase.channel('global_broadcasts')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'broadcasts' }, (payload) => {
-        playPing();
-        if (typeof Alert !== 'undefined') Alert.alert('📢 Platform Update', payload.new.message || 'New announcement from Borla Admin.');
-      })
-      .subscribe();
-
-    return () => { 
-      supabase.removeChannel(sub); 
-      supabase.removeChannel(broadcastSub);
+    return () => {
+      supabase.removeChannel(sub);
     };
   }, [session?.user?.id]);
 
@@ -625,6 +828,13 @@ function App() {
       });
       if (error) throw error;
       
+      // Send a realtime broadcast to guarantee delivery to all connected clients
+      await supabase.channel('platform_broadcasts').send({
+        type: 'broadcast',
+        event: 'new_announcement',
+        payload: { message: newAnnouncement }
+      });
+
       alert('Announcement broadcasted to all users!');
       setNewAnnouncement('');
       fetchBroadcastData();
@@ -1146,7 +1356,7 @@ function App() {
                               className="btn-sm" 
                               style={{ backgroundColor: '#3b82f6', color: '#fff', border: 'none', display: 'flex', alignItems: 'center', gap: '0.25rem' }}
                               onClick={() => {
-                                handleOpenChat(inc.profiles?.id, inc.collector_id);
+                                handleOpenChat(inc.profiles?.id, inc.collector_id, inc.id);
                               }}
                             >
                               <MessageSquare size={12} />
@@ -1272,10 +1482,7 @@ function App() {
                               <button 
                                 className="btn-sm" 
                                 style={{ backgroundColor: 'var(--border)', color: 'var(--text-primary)' }}
-                                onClick={() => {
-                                  const docs = kycFiles.filter(f => f.collector_id === u.id);
-                                  setSelectedUserDocs({ user: u, docs });
-                                }}
+                                onClick={() => handleOpenKycModal(u)}
                               >
                                 <Eye size={14} style={{ marginRight: '0.25rem' }} />
                                 KYC
@@ -1351,9 +1558,20 @@ function App() {
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1.5rem' }}>
                       {selectedUserDocs.docs.length > 0 ? selectedUserDocs.docs.map((doc: any) => (
                         <div key={doc.id} style={{ backgroundColor: 'var(--surface)', padding: '1rem', borderRadius: '1rem', border: '1px solid var(--border)' }}>
-                          <p style={{ fontWeight: 800, color: '#10b981', marginBottom: '0.5rem', textTransform: 'uppercase', fontSize: '0.75rem' }}>{doc.document_type.replace('_', ' ')}</p>
-                          <div style={{ width: '100%', height: '200px', backgroundColor: 'var(--surface-2)', borderRadius: '0.5rem', overflow: 'hidden' }}>
-                            <img src={doc.document_url} style={{ width: '100%', height: '100%', objectFit: 'contain' }} alt="KYC Document" />
+                          <p style={{ fontWeight: 800, color: '#10b981', marginBottom: '0.5rem', textTransform: 'uppercase', fontSize: '0.75rem' }}>{(doc.doc_type || doc.document_type || '').replace('_', ' ')}</p>
+                          <div style={{ width: '100%', height: '200px', backgroundColor: 'var(--surface-2)', borderRadius: '0.5rem', overflow: 'hidden', position: 'relative' }}>
+                            <img 
+                              src={doc.doc_url || doc.document_url} 
+                              style={{ width: '100%', height: '100%', objectFit: 'contain' }} 
+                              alt="KYC Document" 
+                              onError={(e) => {
+                                e.currentTarget.style.display = 'none';
+                                const errDiv = document.createElement('div');
+                                errDiv.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;color:#ef4444;padding:1rem;text-align:center;font-size:0.75rem';
+                                errDiv.innerHTML = '<span>⚠️ Image failed to load</span><span style="color:var(--text-muted);margin-top:0.5rem">Bucket may be private or file deleted.</span>';
+                                e.currentTarget.parentElement?.appendChild(errDiv);
+                              }}
+                            />
                           </div>
                           <p style={{ fontSize: '0.625rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>Uploaded: {new Date(doc.created_at).toLocaleString()}</p>
                         </div>
@@ -1471,25 +1689,28 @@ function App() {
                 <div className="section-card">
                   <div className="section-header">
                     <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
-                      <AlertTriangle size={24} color="#ef4444" />
-                      <h2 className="section-title">Critical Reviews & Flags</h2>
+                      <AlertTriangle size={24} color="#f59e0b" />
+                      <h2 className="section-title">Recent Collector Reviews & Flags</h2>
                     </div>
                   </div>
                   
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
                     {lowRatings.length > 0 ? lowRatings.map((review: any) => (
-                      <div key={review.id} style={{ backgroundColor: 'var(--surface)', padding: '1rem', borderRadius: '1rem', border: '1px solid #ef444433' }}>
-                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
-                          <span style={{ fontWeight: 700, color: 'var(--text-primary)' }}>{review.profiles?.full_name}</span>
+                      <div key={review.id} style={{ backgroundColor: 'var(--surface)', padding: '1rem', borderRadius: '1rem', border: review.rating <= 2 ? '1px solid #ef444433' : '1px solid var(--border)' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '0.5rem' }}>
+                          <div style={{ display: 'flex', flexDirection: 'column' }}>
+                            <span style={{ fontWeight: 700, color: 'var(--text-primary)' }}>Collector: {review.collector_profiles?.full_name || 'Collector'}</span>
+                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>Reviewed by: {review.profiles?.full_name || 'Customer'}</span>
+                          </div>
                           <div style={{ display: 'flex', color: '#f59e0b' }}>
                             {[...Array(5)].map((_, i) => <Star key={i} size={14} fill={i < review.rating ? '#f59e0b' : 'transparent'} />)}
                           </div>
                         </div>
-                        <p style={{ margin: 0, fontSize: '0.875rem', color: 'var(--text-secondary)' }}>"{review.comment || 'No comment provided'}"</p>
-                        <p style={{ margin: '0.5rem 0 0 0', fontSize: '0.75rem', color: 'var(--text-muted)' }}>Service: {review.pickups?.trash_type} • {new Date(review.created_at).toLocaleDateString()}</p>
+                        <p style={{ margin: '0.5rem 0', fontSize: '0.875rem', color: 'var(--text-secondary)' }}>"{review.comment || 'No comment provided'}"</p>
+                        <p style={{ margin: 0, fontSize: '0.75rem', color: 'var(--text-muted)' }}>Service: {review.pickups?.trash_type || 'General Waste'} • {new Date(review.created_at).toLocaleDateString()}</p>
                       </div>
                     )) : (
-                      <p style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '2rem' }}>No critical issues reported.</p>
+                      <p style={{ textAlign: 'center', color: 'var(--text-muted)', padding: '2rem' }}>No reviews reported.</p>
                     )}
                   </div>
                 </div>

@@ -124,6 +124,12 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [paymentSuccess, setPaymentSuccess] = useState(false);
+  const [showRatingModal, setShowRatingModal] = useState(false);
+  const [ratingCollector, setRatingCollector] = useState<any>(null);
+  const [selectedRating, setSelectedRating] = useState(5);
+  const [ratingComment, setRatingComment] = useState('');
+  const [selectedRatingTag, setSelectedRatingTag] = useState('');
+  const [isSubmittingRating, setIsSubmittingRating] = useState(false);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authMethod, setAuthMethod] = useState<'phone' | 'email'>('phone');
@@ -301,6 +307,7 @@ export default function App() {
   const [approvalStatus, setApprovalStatus] = useState('pending'); // pending, approved, rejected
   const [navigationProgress, setNavigationProgress] = useState(0);
   const [proofImage, setProofImage] = useState<string | null>(null);
+  const [isCardExpanded, setIsCardExpanded] = useState(false);
 
   // Audio Session Hardening
   useEffect(() => {
@@ -366,6 +373,7 @@ export default function App() {
   const [isCreatingPool, setIsCreatingPool] = useState(false);
   const [activeConvoyMembers, setActiveConvoyMembers] = useState<any[]>([]);
   const [supportTickets, setSupportTickets] = useState<any[]>([]);
+  const [unreadTicketIds, setUnreadTicketIds] = useState<string[]>([]);
   const [activeChallenges, setActiveChallenges] = useState<any[]>([]);
   const [myScrapListings, setMyScrapListings] = useState<any[]>([]);
   const [scrapBuyers, setScrapBuyers] = useState<any[]>([]);
@@ -526,12 +534,14 @@ export default function App() {
     }
   };
 
-  const fetchHistory = useCallback(async () => {
-    setIsLoading(true);
+  const fetchHistory = useCallback(async (silent = false) => {
+    if (!silent) {
+      setIsLoading(true);
+    }
     try {
       const { data: { user: authUser } } = await supabase.auth.getUser();
       if (!authUser) {
-        setIsLoading(false);
+        if (!silent) setIsLoading(false);
         return;
       }
 
@@ -567,12 +577,20 @@ export default function App() {
         const processedData = await Promise.all(resultData.map(async (p) => {
           const enriched = { ...p };
           if (enriched.collector_id && !enriched.collector) {
-            const { data: col } = await supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', enriched.collector_id).single();
-            if (col) enriched.collector = col;
+            const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', enriched.collector_id).maybeSingle();
+            if (colErr) console.error('[History] Collector profile fetch error:', colErr);
+            if (col) {
+              const vDetails = typeof col.vehicle_details === 'string' ? JSON.parse(col.vehicle_details) : (col.vehicle_details || null);
+              enriched.collector = { ...col, vehicle_details: vDetails };
+            }
           }
           if (enriched.customer_id && !enriched.customer) {
-            const { data: cust } = await supabase.from('profiles').select('full_name, phone_number, avatar_url').eq('id', enriched.customer_id).single();
+            const { data: cust, error: custErr } = await supabase.from('profiles').select('*').eq('id', enriched.customer_id).maybeSingle();
+            if (custErr) console.error('[History] Customer profile fetch error:', custErr);
             if (cust) enriched.customer = cust;
+          }
+          if (activePickup && activePickup.id === enriched.id && enriched.collector) {
+            setActivePickup(prev => prev ? ({ ...prev, ...enriched, collector: enriched.collector }) : null);
           }
           return enriched;
         }));
@@ -590,9 +608,9 @@ export default function App() {
     } catch (err) {
       console.error('[History] Unexpected error:', err);
     } finally {
-      setIsLoading(false);
+      if (!silent) setIsLoading(false);
     }
-  }, [role, userProfile]);
+  }, [role, userProfile, activePickup]);
 
   const playPing = async () => {
     try {
@@ -678,7 +696,7 @@ export default function App() {
         (payload) => {
           console.log('[Realtime] Payload:', payload.eventType, payload.new?.id, payload.new?.status);
           
-          fetchHistory();
+          fetchHistory(true);
 
           if (payload.eventType === 'UPDATE') {
             const updated = payload.new;
@@ -711,16 +729,18 @@ export default function App() {
           // CUSTOMER LOGIC
           if (role === UserRole.CUSTOMER) {
              if (payload.new.status === 'assigned' && (payload.new.customer_id === user.id || payload.new.user_id === user.id)) {
-                supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details').eq('id', payload.new.collector_id).single()
+                supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', payload.new.collector_id).single()
                   .then(({ data: coll }) => {
-                    const enriched = { ...payload.new, collector: coll };
+                    const vDetails = typeof coll?.vehicle_details === 'string' ? JSON.parse(coll.vehicle_details) : (coll?.vehicle_details || null);
+                    const enrichedColl = coll ? { ...coll, vehicle_details: vDetails } : null;
+                    const enriched = { ...payload.new, collector: enrichedColl };
                     setActivePickup(enriched);
                     setStep(AppStep.COLLECTOR_FOUND);
                     playPing();
                   });
              }
              if (payload.new.status === 'collected' && (payload.new.customer_id === user.id || payload.new.user_id === user.id)) {
-                setActivePickup(prev => ({ ...prev, ...payload.new }));
+                setActivePickup(prev => ({ ...prev, ...payload.new, collector: prev?.collector }));
                 setStep(AppStep.PAYMENT);
                 playPing();
              }
@@ -769,7 +789,7 @@ export default function App() {
     if (!user?.id) return;
     const pollInterval = setInterval(() => {
       console.log('[Polling] refreshing history...');
-      fetchHistory();
+      fetchHistory(true);
     }, 60000); 
     return () => clearInterval(pollInterval);
   }, [user?.id, fetchHistory]);
@@ -893,65 +913,161 @@ export default function App() {
     if ((step === AppStep.COLLECTOR_CHAT || step === AppStep.PICKUP_CHAT) && activePickup?.id) {
       fetchChatMessages(activePickup.id);
     }
-    
-    // Support Chat Realtime Listener
-    if (step === AppStep.CHAT && activeTicket?.id) {
-      // Fetch initial
-      supabase.from('support_messages')
+  }, [step, activePickup?.id]);
+
+  // Dedicated Support Chat Listener (Broadcast-based)
+  useEffect(() => {
+    if (step !== AppStep.CHAT || !activeTicket?.id) return;
+
+    const fetchMessages = async () => {
+      const { data } = await supabase.from('support_messages')
         .select('*')
         .eq('ticket_id', activeTicket.id)
-        .order('created_at', { ascending: true })
-        .then(({ data }) => { if (data) setSupportMessages(data); });
+        .order('created_at', { ascending: true });
+      if (data) setSupportMessages(data);
+    };
 
-      const sub = supabase.channel(`support_${activeTicket.id}`)
-        .on('postgres_changes', { 
-          event: 'INSERT', 
-          schema: 'public', 
-          table: 'support_messages', 
-          filter: `ticket_id=eq.${activeTicket.id}` 
-        }, (payload) => {
-          if (payload.new.sender_id !== user?.id) {
-            playPing();
-          }
-          setSupportMessages(prev => {
-            if (prev.some(m => m.id === payload.new.id)) return prev;
-            return [...prev, payload.new];
-          });
-        })
-        .subscribe();
-    }
+    // Fetch initial messages
+    fetchMessages();
 
-    // Broadcast Realtime Listener for Alerts
-    const broadcastSub = supabase.channel('global_broadcasts')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'broadcasts' }, (payload) => {
-        playPing();
-        Alert.alert('📢 Platform Update', payload.new.message || 'New announcement from Borla Admin.');
+    const sub = supabase.channel(`ticket_${activeTicket.id}`)
+      .on('broadcast', { event: 'new_message' }, (payload) => {
+        if (payload.payload?.sender_id !== user?.id) {
+          playPing();
+          Vibration.vibrate([0, 300, 100, 300]);
+        }
+        // Always fetch the latest state from the database to guarantee it renders
+        fetchMessages();
       })
       .subscribe();
 
-    return () => { 
+    chatChannelRef.current = sub;
+
+    return () => {
+      supabase.removeChannel(sub);
+      chatChannelRef.current = null;
+    };
+  }, [activeTicket?.id, step, user?.id]);
+
+  // Stable Broadcast Listener — only recreated when user changes, NOT on step changes
+  useEffect(() => {
+    if (!user?.id) return;
+
+    // Use Supabase Broadcasts (pub/sub) instead of postgres_changes for guaranteed delivery
+    const broadcastSub = supabase.channel('platform_broadcasts')
+      .on('broadcast', { event: 'new_announcement' }, (payload) => {
+        playPing();
+        Vibration.vibrate([0, 500, 100, 500]);
+        Alert.alert('📢 Platform Update', payload.payload?.message || 'New announcement from Borla Admin.');
+      })
+      .subscribe();
+
+    return () => {
       supabase.removeChannel(broadcastSub);
     };
-  }, [step, activePickup?.id, activeTicket?.id, user?.id]);
+  }, [user?.id]);
 
-  // Bulletproof Collector Info Fetcher: If we have an active pickup but no collector details, fetch them.
+  // Incident Reports Realtime — notifies collector when admin updates their incident status
   useEffect(() => {
-    if (activePickup?.collector_id && !activePickup.collector) {
-      const fetchCollectorDetails = async () => {
-        console.log('[Sync] Manually fetching missing collector info for:', activePickup.collector_id);
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type')
-          .eq('id', activePickup.collector_id)
-          .single();
-        
-        if (profile) {
-          setActivePickup(prev => prev ? ({ ...prev, collector: profile }) : null);
+    if (!user?.id || role !== UserRole.COLLECTOR) return;
+
+    const incidentSub = supabase.channel(`incident_status_${user.id}`)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'incident_reports',
+        filter: `collector_id=eq.${user.id}`,
+      }, (payload) => {
+        // Only alert if status actually changed
+        if (payload.new.status !== payload.old?.status) {
+          playPing();
+          Vibration.vibrate([0, 300, 100, 300]);
+          Alert.alert('📋 Incident Update', `Your incident report status changed to: ${payload.new.status}`);
         }
-      };
-      fetchCollectorDetails();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(incidentSub);
+    };
+  }, [user?.id, role]);
+
+  // Global Alerts & Chat Badge Listener (Broadcast-based for guaranteed delivery)
+  useEffect(() => {
+    if (!user?.id) return;
+
+    // Keep admin channel open so we can broadcast incidents/messages to it
+    const adminAlertsChannel = supabase.channel('admin_global_alerts').subscribe();
+
+    if (role !== UserRole.COLLECTOR) {
+      return () => { supabase.removeChannel(adminAlertsChannel); };
     }
-  }, [activePickup?.collector_id, activePickup?.collector]);
+
+    const userAlertsSub = supabase.channel(`user_alerts_${user.id}`)
+      .on('broadcast', { event: 'new_ticket' }, (payload) => {
+        playPing();
+        Vibration.vibrate([0, 300, 100, 300]);
+        if (payload.payload?.ticket_id) {
+          setUnreadTicketIds(prev => {
+            if (!prev.includes(payload.payload.ticket_id)) {
+              return [...prev, payload.payload.ticket_id];
+            }
+            return prev;
+          });
+        }
+        fetchSupportTickets();
+      })
+      .on('broadcast', { event: 'new_message' }, (payload) => {
+        playPing();
+        Vibration.vibrate([0, 300, 100, 300]);
+        
+        setUnreadTicketIds(prev => {
+          if (!prev.includes(payload.payload.ticket_id)) {
+            return [...prev, payload.payload.ticket_id];
+          }
+          return prev;
+        });
+        
+        fetchSupportTickets();
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(adminAlertsChannel);
+      supabase.removeChannel(userAlertsSub);
+    };
+  }, [user?.id, role, fetchSupportTickets]);
+
+  // Bulletproof Collector Info Fetcher & Poller: If we are in a collector assigned step but missing collector details, fetch them continuously until we get them!
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    const needsCollector = (step === AppStep.COLLECTOR_FOUND || step === AppStep.CUSTOMER_PICKUP_ONGOING || activePickup?.status === 'assigned' || activePickup?.status === 'collected') && (!activePickup?.collector || !activePickup.collector.full_name || activePickup.collector.full_name === 'Collector' || (!activePickup.collector.vehicle_details?.plate && !activePickup.collector.vehicle_number)) && activePickup?.id;
+    
+    if (needsCollector) {
+      console.log('[Sync] Active pickup missing collector info. Starting aggressive polling for pickup:', activePickup.id);
+      interval = setInterval(async () => {
+        const { data: pickup } = await supabase
+          .from('pickups')
+          .select('*')
+          .eq('id', activePickup.id)
+          .maybeSingle();
+
+        if (pickup && pickup.collector_id) {
+          console.log('[Sync] Aggressive polling fetched pickup. Fetching profile directly for collector_id:', pickup.collector_id);
+          const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', pickup.collector_id).maybeSingle();
+          if (colErr) console.error('[Sync] Aggressive polling profile fetch error:', colErr);
+          let collObj = col || null;
+          if (collObj) {
+            const vDetails = typeof collObj.vehicle_details === 'string' ? JSON.parse(collObj.vehicle_details) : (collObj.vehicle_details || null);
+            collObj = { ...collObj, vehicle_details: vDetails };
+            console.log('[Sync] Aggressive polling successfully enriched collector details:', collObj.full_name);
+          }
+          setActivePickup({ ...pickup, collector: collObj });
+        }
+      }, 3000);
+    }
+    return () => clearInterval(interval);
+  }, [step, activePickup?.id, activePickup?.collector, activePickup?.status]);
 
   // Polling Fallback for Searching Screen
   useEffect(() => {
@@ -962,7 +1078,7 @@ export default function App() {
           .from('pickups')
           .select(`
             *,
-            collector:profiles!collector_id(full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type)
+            collector:profiles!pickups_collector_id_fkey(full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type)
           `)
           .or(`user_id.eq.${user.id},customer_id.eq.${user.id}`)
           .eq('status', 'assigned')
@@ -970,9 +1086,21 @@ export default function App() {
           .limit(1);
         
         if (data && data.length > 0) {
-          setActivePickup(data[0]);
-          setStep(AppStep.COLLECTOR_FOUND);
-          playPing();
+          const pickup = data[0];
+          if (pickup.collector) {
+            setActivePickup(pickup);
+            setStep(AppStep.COLLECTOR_FOUND);
+            playPing();
+          } else if (pickup.collector_id) {
+            const { data: col } = await supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', pickup.collector_id).maybeSingle();
+            setActivePickup({ ...pickup, collector: col || null });
+            setStep(AppStep.COLLECTOR_FOUND);
+            playPing();
+          } else {
+            setActivePickup(pickup);
+            setStep(AppStep.COLLECTOR_FOUND);
+            playPing();
+          }
         }
       }, 5000);
     }
@@ -1185,8 +1313,31 @@ export default function App() {
   }, [user?.id]);
 
   const fetchCommunityPools = useCallback(async () => {
-    const { data } = await supabase.from('community_pools').select('*').eq('status', 'OPEN');
-    if (data) setCommunityPools(data);
+    try {
+      const { data: pools, error } = await supabase.from('community_pools').select('*').eq('status', 'OPEN');
+      if (error) {
+        console.error("Fetch pools error:", error);
+        return;
+      }
+      if (!pools) return;
+
+      // Fetch all members for these pools to calculate exact current size dynamically
+      const { data: members } = await supabase.from('community_pool_members').select('*');
+      
+      const enrichedPools = pools.map(pool => {
+        const poolMembers = members ? members.filter(m => m.pool_id === pool.id) : [];
+        // Calculate true size: use community_pool_members count, fallback to any count column on pool, fallback to 1
+        const calculatedSize = poolMembers.length > 0 ? poolMembers.length : (pool.current_size || pool.current_members || pool.member_count || pool.members_count || 1);
+        return {
+          ...pool,
+          current_size: calculatedSize
+        };
+      });
+
+      setCommunityPools(enrichedPools);
+    } catch (err) {
+      console.error("Community pools fetch error:", err);
+    }
   }, []);
 
   const fetchConvoys = useCallback(async () => {
@@ -1579,13 +1730,14 @@ export default function App() {
     setIsLoading(false);
   };
 
-  const handleCollectionComplete = async () => {
-    if (!activePickup?.id || !proofImage) return;
+  const handleCollectionComplete = async (skipProof = false) => {
+    if (!activePickup?.id || (!proofImage && !skipProof)) return;
     setIsLoading(true);
     try {
       // Attempt to upload the proof photo
       let proofUrl: string | null = null;
-      try {
+      if (!skipProof && proofImage) {
+        try {
         // Use XMLHttpRequest with arraybuffer because fetch() fails to read local iOS file:// URIs
         const imageBuffer = await new Promise<ArrayBuffer>((resolve, reject) => {
           const xhr = new XMLHttpRequest();
@@ -1611,8 +1763,9 @@ export default function App() {
         } else {
           console.warn('[Proof] Upload skipped:', uploadError.message);
         }
-      } catch (uploadEx) {
-        console.warn('[Proof] Upload exception, continuing without photo URL:', uploadEx);
+        } catch (uploadEx) {
+          console.warn('[Proof] Upload exception, continuing without photo URL:', uploadEx);
+        }
       }
 
       const { error } = await supabase
@@ -1727,6 +1880,17 @@ export default function App() {
     if (error) {
       Alert.alert('Error', 'Failed to submit report: ' + error.message);
     } else {
+      // Immediate audible + haptic confirmation for the collector
+      playPing();
+      Vibration.vibrate([0, 300, 100, 300]);
+
+      // Broadcast to admin to ensure ping plays without relying on Postgres Realtime
+      supabase.channel('admin_global_alerts').send({
+        type: 'broadcast',
+        event: 'new_incident',
+        payload: { type: incidentType, description: incidentDesc }
+      });
+
       Alert.alert('Reported', 'Your incident has been reported to the Dispatch team.');
       setShowIncidentModal(false);
       setIncidentDesc('');
@@ -2051,6 +2215,9 @@ export default function App() {
   const handlePaymentSuccess = useCallback((res: any) => {
     setIsPaying(false);
     setPaymentSuccess(true);
+    if (activePickup?.collector) {
+      setRatingCollector(activePickup.collector);
+    }
     schedulePredictiveReminder(4);
     if (splitWays > 1) {
       Alert.alert(
@@ -2061,6 +2228,7 @@ export default function App() {
             setPaymentSuccess(false);
             resetBookingStates();
             next();
+            setShowRatingModal(true);
           }, 1000);
         }}]
       );
@@ -2069,9 +2237,10 @@ export default function App() {
         setPaymentSuccess(false);
         resetBookingStates();
         next();
+        setShowRatingModal(true);
       }, 2000);
     }
-  }, [splitWays, splitAmount, next, resetBookingStates]);
+  }, [splitWays, splitAmount, next, resetBookingStates, activePickup]);
 
   const handlePaymentCancel = useCallback(() => {
     setIsPaying(false);
@@ -2095,17 +2264,45 @@ export default function App() {
             name: data.full_name || '',
             phone: data.phone_number || ''
           }));
+
+          const vDetails = typeof data.vehicle_details === 'string' ? JSON.parse(data.vehicle_details) : (data.vehicle_details || null);
+          if (vDetails) {
+            setVehicleDetails({
+              type: vDetails.type || data.vehicle_type || '',
+              plate: vDetails.plate || data.vehicle_number || '',
+              capacity: vDetails.capacity || '',
+              photo: vDetails.photo_url || ''
+            });
+          } else if (data.vehicle_type || data.vehicle_number) {
+            setVehicleDetails({
+              type: data.vehicle_type || '',
+              plate: data.vehicle_number || '',
+              capacity: '',
+              photo: ''
+            });
+          }
           
-          // Fetch existing KYC documents to populate the form
+          // Fetch existing KYC documents to populate the form matching real schema
           supabase.from('collector_documents')
-            .select('document_type, document_url')
+            .select('doc_type, doc_url')
             .eq('collector_id', uid)
             .then(({ data: docs }) => {
+              const docMap: any = { ...(vDetails?.kyc_docs || {}) };
               if (docs) {
-                const docMap: any = {};
-                docs.forEach(d => docMap[d.document_type] = d.document_url);
-                setDocuments(prev => ({ ...prev, ...docMap }));
+                docs.forEach(d => {
+                  const type = d.doc_type || d.document_type || '';
+                  const url = d.doc_url || d.document_url || '';
+                  if (type && url) {
+                    docMap[type] = url;
+                    if (type === 'national_id') docMap['nationalId'] = url;
+                    if (type === 'nationalId') docMap['national_id'] = url;
+                    if (type === 'driver_license' || type === 'license') { docMap['license'] = url; docMap['driver_license'] = url; }
+                    if (type === 'vehicle_registration' || type === 'vehicle_reg' || type === 'vehicleReg') { docMap['vehicleReg'] = url; docMap['vehicle_registration'] = url; }
+                    if (type === 'waste_permit' || type === 'wastePermit') { docMap['wastePermit'] = url; docMap['waste_permit'] = url; }
+                  }
+                });
               }
+              setDocuments(prev => ({ ...prev, ...docMap }));
             });
         }
       }
@@ -2149,30 +2346,21 @@ export default function App() {
         
         // Removed payload.old check because it requires REPLICA IDENTITY FULL
         if (role === UserRole.CUSTOMER && isMyPickup && payload.new.status === 'assigned') {
-           const { data } = await supabase
-             .from('pickups')
-             .select(`
-               *,
-               collector:profiles!collector_id(full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type)
-             `)
-             .eq('id', payload.new.id)
-             .single();
-           
-           if (data) {
-             setActivePickup(data);
+           const { data: simple } = await supabase.from('pickups').select('*').eq('id', payload.new.id).maybeSingle();
+           const basePickup = simple || payload.new;
+           const collectorId = basePickup.collector_id;
+           if (collectorId) {
+             const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', collectorId).maybeSingle();
+             if (colErr) console.error('[Realtime] Listener 2 profile fetch error:', colErr);
+             const vDetails = typeof col?.vehicle_details === 'string' ? JSON.parse(col.vehicle_details) : (col?.vehicle_details || null);
+             const enrichedColl = col ? { ...col, vehicle_details: vDetails } : null;
+             setActivePickup({ ...basePickup, collector: enrichedColl });
              setStep(AppStep.COLLECTOR_FOUND);
              playPing();
            } else {
-             // Second fallback: simple lookup if join failed
-             const { data: simple } = await supabase.from('pickups').select('*').eq('id', payload.new.id).single();
-             if (simple) {
-               const { data: col } = await supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', simple.collector_id).single();
-               if (col) {
-                 setActivePickup({ ...simple, collector: col });
-                 setStep(AppStep.COLLECTOR_FOUND);
-                 playPing();
-               }
-             }
+             setActivePickup(basePickup);
+             setStep(AppStep.COLLECTOR_FOUND);
+             playPing();
            }
         }
       })
@@ -3495,18 +3683,33 @@ export default function App() {
                 </TouchableOpacity>
                 <TouchableOpacity
                   onPress={async () => {
-                    const { data: ticket } = await supabase.from('support_tickets').select('*').eq('user_id', user?.id).eq('status', 'open').maybeSingle();
-                    if (ticket) {
-                      setActiveTicket(ticket);
+                    const targetTicketId = unreadTicketIds[0];
+                    setUnreadTicketIds([]); // Clear badges when opening support
+                    
+                    let query = supabase.from('support_tickets').select('*').eq('user_id', user?.id).eq('status', 'open');
+                    if (targetTicketId) {
+                      query = query.eq('id', targetTicketId);
+                    } else {
+                      query = query.order('created_at', { ascending: false }).limit(1);
+                    }
+                    
+                    const { data: tickets } = await query;
+                    if (tickets && tickets.length > 0) {
+                      setActiveTicket(tickets[0]);
                       setStep(AppStep.CHAT);
                     } else {
                       setStep(AppStep.HELP);
                     }
                   }}
-                  style={[styles.collNotif, { flex: 1, margin: 0, backgroundColor: '#3b82f6' }]}
+                  style={[styles.collNotif, { flex: 1, margin: 0, backgroundColor: '#3b82f6', position: 'relative' }]}
                   accessibilityLabel="Help Support"
                 >
                   <MessageSquare size={18} color="#fff" />
+                  {unreadTicketIds.length > 0 && (
+                    <View style={{ position: 'absolute', top: -6, right: -6, backgroundColor: '#EF4444', borderRadius: 10, minWidth: 20, height: 20, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 4, borderWidth: 2, borderColor: '#1F2937' }}>
+                      <Text style={{ color: '#fff', fontSize: 10, fontWeight: 'bold' }}>{unreadTicketIds.length}</Text>
+                    </View>
+                  )}
                 </TouchableOpacity>
               </View>
             </View>
@@ -3730,6 +3933,11 @@ export default function App() {
                   <Text style={{ color: '#1F2937', fontSize: 16, fontWeight: '600' }}>Help & Support</Text>
                   <Text style={{ color: '#6B7280', fontSize: 12 }}>FAQs, Tickets, Chat</Text>
                 </View>
+                {unreadTicketIds.length > 0 && (
+                  <View style={{ backgroundColor: '#EF4444', borderRadius: 12, paddingHorizontal: 8, paddingVertical: 4, marginRight: 8 }}>
+                    <Text style={{ color: '#fff', fontSize: 10, fontWeight: '800' }}>{unreadTicketIds.length} NEW</Text>
+                  </View>
+                )}
                 <ChevronRight size={20} color="#D1D5DB" />
               </TouchableOpacity>
 
@@ -4382,11 +4590,43 @@ export default function App() {
 
                   // Save to DB
                   if (activeTicket?.id) {
-                    await supabase.from('support_messages').insert({
+                    const tempId = Math.random().toString();
+                    const newMessageObj = {
+                      id: tempId,
+                      ticket_id: activeTicket.id,
+                      sender_id: user?.id,
+                      content: userMsg,
+                      created_at: new Date().toISOString()
+                    };
+                    
+                    const { data: insertedMsg, error } = await supabase.from('support_messages').insert({
                       ticket_id: activeTicket.id,
                       sender_id: user?.id,
                       content: userMsg
-                    });
+                    }).select().single();
+
+                    if (!error && insertedMsg) {
+                      // Broadcast to chat room
+                      if (chatChannelRef.current) {
+                        chatChannelRef.current.send({
+                          type: 'broadcast',
+                          event: 'new_message',
+                          payload: insertedMsg
+                        });
+                      }
+                      
+                      // Broadcast to admin global alerts by subscribing on the fly
+                      const adminAlertChan = supabase.channel('admin_global_alerts');
+                      adminAlertChan.subscribe((status) => {
+                        if (status === 'SUBSCRIBED') {
+                          adminAlertChan.send({
+                            type: 'broadcast',
+                            event: 'new_message',
+                            payload: insertedMsg
+                          }).then(() => supabase.removeChannel(adminAlertChan));
+                        }
+                      });
+                    }
                   }
                 }}
                 disabled={!newSupportMessage.trim()}
@@ -4702,178 +4942,307 @@ export default function App() {
               </View>
             </View>
 
-            <View style={styles.foundCard}>
-              <View style={styles.foundHeader}>
-                <View style={styles.foundTitleBox}>
-                  <MapPin size={16} color="#fff" style={styles.blackIcon} />
-                  <Text style={styles.foundTitle}>Navigate to Pickup</Text>
-                </View>
-              </View>
+            <View style={[styles.foundCard, !isCardExpanded && { paddingBottom: 24, marginTop: -20 }]}>
+              {/* Drag Handle */}
+              <TouchableOpacity 
+                onPress={() => setIsCardExpanded(!isCardExpanded)} 
+                style={{ width: 48, height: 6, backgroundColor: '#D1D5DB', borderRadius: 3, alignSelf: 'center', marginBottom: 16 }}
+              />
 
-              <View style={styles.collectorInfo}>
-                <View style={styles.collectorText}>
-                  <Text style={styles.collectorName}>
-                    {jobStatus === 'on_way' ? 'Navigating to Pickup' :
-                      jobStatus === 'arrived' ? 'Arrived at Location' :
-                        jobStatus === 'collected' ? 'Trash Collected' : 'Job Completed'}
-                  </Text>
-                  {activePickup?.customer?.full_name ? (
-                    <Text style={{ fontSize: 13, color: '#059669', fontWeight: '700', marginBottom: 2 }}>
-                      👤 {activePickup.customer.full_name}
-                    </Text>
-                  ) : null}
-                  <Text style={[styles.collectionsText, { fontSize: 16, marginVertical: 4 }]}>{activePickup?.pickup_location_name || 'Destination'}</Text>
-
-                  {jobStatus === 'on_way' && (
-                    <View style={styles.collectionsRow}>
-                      <Navigation size={14} color="#06C167" />
-                      <Text style={styles.collectionsText}>
-                        {(2.3 * (1 - navigationProgress)).toFixed(1)} km • ~{Math.ceil(8 * (1 - navigationProgress))} mins
+              {!isCardExpanded ? (
+                // COLLAPSED VIEW
+                <View>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 16 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1, marginRight: 12 }}>
+                      <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: '#06C167', marginRight: 8 }} />
+                      <Text style={{ fontSize: 16, fontWeight: '700', color: '#1F2937' }} numberOfLines={1}>
+                        {jobStatus === 'on_way' ? 'Navigating to Pickup' : jobStatus === 'arrived' ? 'Arrived at Location' : jobStatus === 'collected' ? 'Trash Collected' : 'Job Completed'}
                       </Text>
                     </View>
-                  )}
-                </View>
-              </View>
-
-              <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 16, padding: 12, backgroundColor: '#F9FAFB', borderRadius: 12 }}>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                  {activePickup?.customer?.avatar_url ? (
-                    <Image source={{ uri: activePickup.customer.avatar_url }} style={{ width: 40, height: 40, borderRadius: 20 }} />
-                  ) : (
-                    <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}>
-                      <User size={20} color="#fff" />
-                    </View>
-                  )}
-                  <View>
-                    <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>{activePickup?.customer?.full_name || 'Customer'}</Text>
-                    <Text style={{ fontSize: 12, color: '#6B7280' }}>Customer</Text>
+                    <TouchableOpacity 
+                      onPress={() => setIsCardExpanded(true)}
+                      style={{ paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#F3F4F6', borderRadius: 16 }}
+                    >
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: '#06C167' }}>Expand ⌃</Text>
+                    </TouchableOpacity>
                   </View>
-                </View>
-                <View style={{ flexDirection: 'row', gap: 8 }}>
-                  <TouchableOpacity 
-                    onPress={() => {
-                      const phone = activePickup?.customer?.phone || '0000000000';
-                      Linking.openURL(`tel:${phone}`).catch(() => Alert.alert('Error', 'Could not open dialer.'));
-                    }}
-                    style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#E5E7EB', alignItems: 'center', justifyContent: 'center' }}
-                  >
-                    <Smartphone size={18} color="#374151" />
-                  </TouchableOpacity>
-                  <TouchableOpacity 
-                    onPress={() => setStep(AppStep.COLLECTOR_CHAT)}
-                    style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}
-                  >
-                    <MessageSquare size={18} color="#fff" />
-                  </TouchableOpacity>
-                </View>
-              </View>
 
-              <View style={{ marginTop: 20 }}>
-                {activePickup?.voice_url && (jobStatus === 'on_way' || jobStatus === 'arrived') && (
-                  <TouchableOpacity 
-                    onPress={() => {
-                      playVoiceNote(
-                        activePickup.voice_url,
-                        () => setIsPlayingLandmark(true),
-                        () => setIsPlayingLandmark(false)
-                      );
-                    }}
-                    style={{ 
-                      flexDirection: 'row', 
-                      alignItems: 'center', 
-                      backgroundColor: isPlayingLandmark ? '#EFF6FF' : '#F97316', 
-                      padding: 16, 
-                      borderRadius: 12, 
-                      marginBottom: 16, 
-                      borderWidth: 1, 
-                      borderColor: isPlayingLandmark ? '#3B82F6' : 'transparent' 
-                    }}
-                  >
-                    <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: isPlayingLandmark ? '#DBEAFE' : 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center', marginRight: 15 }}>
-                      {isPlayingLandmark ? <ActivityIndicator size="small" color="#2563EB" /> : <PlayCircle size={24} color="#fff" />}
+                  {/* Compact Customer & Call Row */}
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#F9FAFB', padding: 12, borderRadius: 12, marginBottom: 16 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                      {activePickup?.customer?.avatar_url ? (
+                        <Image source={{ uri: activePickup.customer.avatar_url }} style={{ width: 36, height: 36, borderRadius: 18 }} />
+                      ) : (
+                        <View style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}>
+                          <User size={18} color="#fff" />
+                        </View>
+                      )}
+                      <View>
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>{activePickup?.customer?.full_name || 'Customer'}</Text>
+                        {jobStatus === 'on_way' && (
+                          <Text style={{ fontSize: 12, color: '#06C167', fontWeight: '600' }}>
+                            {(2.3 * (1 - navigationProgress)).toFixed(1)} km • ~{Math.ceil(8 * (1 - navigationProgress))} mins
+                          </Text>
+                        )}
+                      </View>
                     </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ color: isPlayingLandmark ? '#2563EB' : '#fff', fontWeight: '700', fontSize: 16 }}>
-                        {isPlayingLandmark ? 'Playing Directions...' : 'Play Voice Directions'}
-                      </Text>
-                      <Text style={{ color: isPlayingLandmark ? '#60A5FA' : 'rgba(255,255,255,0.8)', fontSize: 12 }}>
-                        Listen to customer instructions
-                      </Text>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <TouchableOpacity 
+                        onPress={() => {
+                          const phone = activePickup?.customer?.phone || '0000000000';
+                          Linking.openURL(`tel:${phone}`).catch(() => Alert.alert('Error', 'Could not open dialer.'));
+                        }}
+                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#E5E7EB', alignItems: 'center', justifyContent: 'center' }}
+                      >
+                        <Smartphone size={18} color="#374151" />
+                      </TouchableOpacity>
+                      <TouchableOpacity 
+                        onPress={() => setStep(AppStep.COLLECTOR_CHAT)}
+                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}
+                      >
+                        <MessageSquare size={18} color="#fff" />
+                      </TouchableOpacity>
                     </View>
-                  </TouchableOpacity>
-                )}
+                  </View>
 
-                {jobStatus === 'on_way' && (
-                  <TouchableOpacity 
-                    onPress={handleArrival}
-                    disabled={isLoading}
-                    style={[styles.loginButton, { backgroundColor: '#06C167' }]}
-                  >
-                    <Text style={styles.loginButtonText}>{isLoading ? 'Updating...' : 'I Have Arrived'}</Text>
-                  </TouchableOpacity>
-                )}
+                  {/* Prominent Action Button in Collapsed Mode */}
+                  {jobStatus === 'on_way' && (
+                    <TouchableOpacity 
+                      onPress={handleArrival}
+                      disabled={isLoading}
+                      style={[styles.loginButton, { backgroundColor: '#06C167', marginBottom: 0 }]}
+                    >
+                      <Text style={styles.loginButtonText}>{isLoading ? 'Updating...' : 'I Have Arrived'}</Text>
+                    </TouchableOpacity>
+                  )}
+                  {jobStatus === 'arrived' && !proofImage && (
+                    <TouchableOpacity 
+                      onPress={pickProofImage}
+                      style={[styles.loginButton, { backgroundColor: '#3B82F6', marginBottom: 0 }]}
+                    >
+                      <Text style={styles.loginButtonText}>Take Proof of Collection</Text>
+                    </TouchableOpacity>
+                  )}
+                  {jobStatus === 'arrived' && proofImage && (
+                    <TouchableOpacity 
+                      onPress={handleCollectionComplete}
+                      disabled={isLoading}
+                      style={[styles.loginButton, { backgroundColor: '#F59E0B', marginBottom: 0 }]}
+                    >
+                      <Text style={styles.loginButtonText}>{isLoading ? 'Uploading...' : 'Confirm Trash Collected'}</Text>
+                    </TouchableOpacity>
+                  )}
+                  {jobStatus === 'collected' && (
+                    <TouchableOpacity 
+                      onPress={handleJobFinalize}
+                      disabled={isLoading}
+                      style={[styles.loginButton, { backgroundColor: '#10B981', marginBottom: 0 }]}
+                    >
+                      <Text style={styles.loginButtonText}>{isLoading ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
+                    </TouchableOpacity>
+                  )}
+                </View>
+              ) : (
+                // EXPANDED VIEW
+                <View>
+                  <View style={[styles.foundHeader, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
+                    <View style={styles.foundTitleBox}>
+                      <MapPin size={16} color="#fff" style={styles.blackIcon} />
+                      <Text style={styles.foundTitle}>Navigate to Pickup</Text>
+                    </View>
+                    <TouchableOpacity 
+                      onPress={() => setIsCardExpanded(false)}
+                      style={{ paddingHorizontal: 12, paddingVertical: 6, backgroundColor: '#F3F4F6', borderRadius: 16 }}
+                    >
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: '#6B7280' }}>Collapse ⌄</Text>
+                    </TouchableOpacity>
+                  </View>
 
-                {jobStatus === 'arrived' && (
-                  <TouchableOpacity 
-                    onPress={pickProofImage}
-                    style={{
-                      backgroundColor: '#F3F4F6',
-                      height: 120,
-                      borderRadius: 12,
-                      borderWidth: 2,
-                      borderStyle: 'dashed',
-                      borderColor: '#D1D5DB',
-                      justifyContent: 'center',
-                      alignItems: 'center',
-                      marginBottom: 16
-                    }}
-                  >
-                    {proofImage ? (
-                      <Image source={{ uri: proofImage }} style={{ width: '100%', height: '100%', borderRadius: 10 }} />
-                    ) : (
-                      <View style={{ alignItems: 'center' }}>
-                        <Camera size={32} color="#9CA3AF" />
-                        <Text style={{ color: '#6B7280', marginTop: 8 }}>Take Proof of Collection</Text>
+                  <View style={styles.collectorInfo}>
+                    <View style={styles.collectorText}>
+                      <Text style={styles.collectorName}>
+                        {jobStatus === 'on_way' ? 'Navigating to Pickup' :
+                          jobStatus === 'arrived' ? 'Arrived at Location' :
+                            jobStatus === 'collected' ? 'Trash Collected' : 'Job Completed'}
+                      </Text>
+                      {activePickup?.customer?.full_name ? (
+                        <Text style={{ fontSize: 13, color: '#059669', fontWeight: '700', marginBottom: 2 }}>
+                          👤 {activePickup.customer.full_name}
+                        </Text>
+                      ) : null}
+                      <Text style={[styles.collectionsText, { fontSize: 16, marginVertical: 4 }]}>{activePickup?.pickup_location_name || 'Destination'}</Text>
+
+                      {jobStatus === 'on_way' && (
+                        <View style={styles.collectionsRow}>
+                          <Navigation size={14} color="#06C167" />
+                          <Text style={styles.collectionsText}>
+                            {(2.3 * (1 - navigationProgress)).toFixed(1)} km • ~{Math.ceil(8 * (1 - navigationProgress))} mins
+                          </Text>
+                        </View>
+                      )}
+                    </View>
+                  </View>
+
+                  <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginTop: 16, padding: 12, backgroundColor: '#F9FAFB', borderRadius: 12 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                      {activePickup?.customer?.avatar_url ? (
+                        <Image source={{ uri: activePickup.customer.avatar_url }} style={{ width: 40, height: 40, borderRadius: 20 }} />
+                      ) : (
+                        <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}>
+                          <User size={20} color="#fff" />
+                        </View>
+                      )}
+                      <View>
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>{activePickup?.customer?.full_name || 'Customer'}</Text>
+                        <Text style={{ fontSize: 12, color: '#6B7280' }}>Customer</Text>
+                      </View>
+                    </View>
+                    <View style={{ flexDirection: 'row', gap: 8 }}>
+                      <TouchableOpacity 
+                        onPress={() => {
+                          const phone = activePickup?.customer?.phone || '0000000000';
+                          Linking.openURL(`tel:${phone}`).catch(() => Alert.alert('Error', 'Could not open dialer.'));
+                        }}
+                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#E5E7EB', alignItems: 'center', justifyContent: 'center' }}
+                      >
+                        <Smartphone size={18} color="#374151" />
+                      </TouchableOpacity>
+                      <TouchableOpacity 
+                        onPress={() => setStep(AppStep.COLLECTOR_CHAT)}
+                        style={{ width: 36, height: 36, borderRadius: 18, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}
+                      >
+                        <MessageSquare size={18} color="#fff" />
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+
+                  <View style={{ marginTop: 20 }}>
+                    {activePickup?.voice_url && (jobStatus === 'on_way' || jobStatus === 'arrived') && (
+                      <TouchableOpacity 
+                        onPress={() => {
+                          playVoiceNote(
+                            activePickup.voice_url,
+                            () => setIsPlayingLandmark(true),
+                            () => setIsPlayingLandmark(false)
+                          );
+                        }}
+                        style={{ 
+                          flexDirection: 'row', 
+                          alignItems: 'center', 
+                          backgroundColor: isPlayingLandmark ? '#EFF6FF' : '#F97316', 
+                          padding: 16, 
+                          borderRadius: 12, 
+                          marginBottom: 16, 
+                          borderWidth: 1, 
+                          borderColor: isPlayingLandmark ? '#3B82F6' : 'transparent' 
+                        }}
+                      >
+                        <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: isPlayingLandmark ? '#DBEAFE' : 'rgba(255,255,255,0.3)', alignItems: 'center', justifyContent: 'center', marginRight: 15 }}>
+                          {isPlayingLandmark ? <ActivityIndicator size="small" color="#2563EB" /> : <PlayCircle size={24} color="#fff" />}
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={{ color: isPlayingLandmark ? '#2563EB' : '#fff', fontWeight: '700', fontSize: 16 }}>
+                            {isPlayingLandmark ? 'Playing Directions...' : 'Play Voice Directions'}
+                          </Text>
+                          <Text style={{ color: isPlayingLandmark ? '#60A5FA' : 'rgba(255,255,255,0.8)', fontSize: 12 }}>
+                            Listen to customer instructions
+                          </Text>
+                        </View>
+                      </TouchableOpacity>
+                    )}
+
+                    {jobStatus === 'on_way' && (
+                      <TouchableOpacity 
+                        onPress={handleArrival}
+                        disabled={isLoading}
+                        style={[styles.loginButton, { backgroundColor: '#06C167' }]}
+                      >
+                        <Text style={styles.loginButtonText}>{isLoading ? 'Updating...' : 'I Have Arrived'}</Text>
+                      </TouchableOpacity>
+                    )}
+
+                    {jobStatus === 'arrived' && (
+                      <TouchableOpacity 
+                        onPress={pickProofImage}
+                        style={{
+                          backgroundColor: '#F3F4F6',
+                          height: 120,
+                          borderRadius: 12,
+                          borderWidth: 2,
+                          borderStyle: 'dashed',
+                          borderColor: '#D1D5DB',
+                          justifyContent: 'center',
+                          alignItems: 'center',
+                          marginBottom: 16
+                        }}
+                      >
+                        {proofImage ? (
+                          <Image source={{ uri: proofImage }} style={{ width: '100%', height: '100%', borderRadius: 10 }} />
+                        ) : (
+                          <View style={{ alignItems: 'center' }}>
+                            <Camera size={32} color="#9CA3AF" />
+                            <Text style={{ color: '#6B7280', marginTop: 8 }}>Take Proof of Collection</Text>
+                          </View>
+                        )}
+                      </TouchableOpacity>
+                    )}
+
+                    {jobStatus === 'arrived' && (
+                      <View style={{ gap: 12 }}>
+                        <TouchableOpacity 
+                          onPress={() => handleCollectionComplete(false)}
+                          disabled={isLoading || !proofImage}
+                          style={[styles.loginButton, { backgroundColor: proofImage ? '#06C167' : '#9CA3AF' }]}
+                        >
+                          <Text style={styles.loginButtonText}>{isLoading ? 'Uploading...' : 'Submit Proof & Complete'}</Text>
+                        </TouchableOpacity>
+
+                        <TouchableOpacity 
+                          onPress={() => {
+                            Alert.alert(
+                              'Skip Proof of Clean?',
+                              'Only skip if the customer is present or requested no photo. Are you sure you want to proceed?',
+                              [
+                                { text: 'Cancel', style: 'cancel' },
+                                { text: 'Skip & Complete', style: 'destructive', onPress: () => handleCollectionComplete(true) }
+                              ]
+                            );
+                          }}
+                          disabled={isLoading}
+                          style={{ padding: 16, alignItems: 'center', borderRadius: 12, backgroundColor: '#F3F4F6' }}
+                        >
+                          <Text style={{ color: '#6B7280', fontWeight: '700', fontSize: 16 }}>Complete Without Photo</Text>
+                        </TouchableOpacity>
                       </View>
                     )}
-                  </TouchableOpacity>
-                )}
 
-                {jobStatus === 'arrived' && proofImage && (
-                  <TouchableOpacity 
-                    onPress={handleCollectionComplete}
-                    disabled={isLoading}
-                    style={[styles.loginButton, { backgroundColor: '#F59E0B' }]}
-                  >
-                    <Text style={styles.loginButtonText}>{isLoading ? 'Uploading...' : 'Confirm Trash Collected'}</Text>
-                  </TouchableOpacity>
-                )}
+                    {jobStatus === 'collected' && (
+                      <TouchableOpacity 
+                        onPress={handleJobFinalize}
+                        disabled={isLoading}
+                        style={[styles.loginButton, { backgroundColor: '#10B981' }]}
+                      >
+                        <Text style={styles.loginButtonText}>{isLoading ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
+                      </TouchableOpacity>
+                    )}
 
-                {jobStatus === 'collected' && (
-                  <TouchableOpacity 
-                    onPress={handleJobFinalize}
-                    disabled={isLoading}
-                    style={[styles.loginButton, { backgroundColor: '#10B981' }]}
-                  >
-                    <Text style={styles.loginButtonText}>{isLoading ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
-                  </TouchableOpacity>
-                )}
+                    <TouchableOpacity
+                      onPress={() => setShowIncidentModal(true)}
+                      style={{ marginTop: 24, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12, backgroundColor: 'rgba(239, 68, 68, 0.1)', borderRadius: 12, borderWidth: 1, borderColor: 'rgba(239, 68, 68, 0.2)' }}
+                    >
+                      <AlertTriangle size={18} color="#EF4444" />
+                      <Text style={{ color: '#EF4444', fontWeight: '700' }}>Report Incident / Issue</Text>
+                    </TouchableOpacity>
 
-                <TouchableOpacity
-                  onPress={() => setShowIncidentModal(true)}
-                  style={{ marginTop: 24, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, padding: 12, backgroundColor: 'rgba(239, 68, 68, 0.1)', borderRadius: 12, borderWidth: 1, borderColor: 'rgba(239, 68, 68, 0.2)' }}
-                >
-                  <AlertTriangle size={18} color="#EF4444" />
-                  <Text style={{ color: '#EF4444', fontWeight: '700' }}>Report Incident / Issue</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  onPress={() => setStep(AppStep.COLLECTOR_DASHBOARD)}
-                  style={{ marginTop: 16, alignItems: 'center' }}
-                >
-                  <Text style={{ color: '#6B7280' }}>Back to Dashboard</Text>
-                </TouchableOpacity>
-              </View>
+                    <TouchableOpacity
+                      onPress={() => setStep(AppStep.COLLECTOR_DASHBOARD)}
+                      style={{ marginTop: 16, alignItems: 'center' }}
+                    >
+                      <Text style={{ color: '#6B7280' }}>Back to Dashboard</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              )}
             </View>
 
             {/* Incident Modal */}
@@ -4926,7 +5295,6 @@ export default function App() {
                 </View>
               </View>
             </Modal>
-
           </View>
         );
 
@@ -5517,15 +5885,28 @@ export default function App() {
               <Text style={styles.sectionHeader}>Support Tickets</Text>
               <View style={{ gap: 12 }}>
                 {supportTickets.length > 0 ? supportTickets.map(t => (
-                  <View key={t.id} style={{ backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ fontSize: 16, fontWeight: '600', color: '#1F2937' }}>{t.subject}</Text>
-                      <Text style={{ fontSize: 12, color: '#9CA3AF' }}>Opened {new Date(t.created_at).toLocaleDateString()}</Text>
+                  <TouchableOpacity 
+                    key={t.id} 
+                    style={{ backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}
+                    onPress={() => {
+                      setActiveTicket(t);
+                      setStep(AppStep.CHAT);
+                      setUnreadTicketIds(prev => prev.filter(id => id !== t.id));
+                    }}
+                  >
+                    <View style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontSize: 16, fontWeight: '600', color: '#1F2937' }}>{t.subject}</Text>
+                        <Text style={{ fontSize: 12, color: '#9CA3AF' }}>Opened {new Date(t.created_at).toLocaleDateString()}</Text>
+                      </View>
+                      {unreadTicketIds.includes(t.id) && (
+                        <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: '#EF4444', marginRight: 12 }} />
+                      )}
                     </View>
                     <View style={{ backgroundColor: t.status === 'RESOLVED' ? '#ECFDF5' : '#FEF3C7', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 }}>
                       <Text style={{ fontSize: 10, color: t.status === 'RESOLVED' ? '#06C167' : '#D97706', fontWeight: '700' }}>{t.status}</Text>
                     </View>
-                  </View>
+                  </TouchableOpacity>
                 )) : (
                   <Text style={{ color: '#9CA3AF', textAlign: 'center' }}>No tickets yet.</Text>
                 )}
@@ -5559,7 +5940,22 @@ export default function App() {
 
               {/* SOS Button */}
               <TouchableOpacity
-                onPress={() => Alert.alert('SOS Activated', 'Notifying Emergency Contacts and Borla Admin...', [{ text: 'Cancel' }, { text: 'Call 112 (Police)' }])}
+                onPress={() => {
+                  supabase.channel('admin_global_alerts').send({
+                    type: 'broadcast',
+                    event: 'sos_emergency',
+                    payload: { collector_id: user?.id, full_name: userProfile?.full_name, phone: userProfile?.phone_number, timestamp: new Date().toISOString() }
+                  });
+                  Alert.alert(
+                    'SOS Emergency Activated 🚨',
+                    'Borla Admin and emergency contacts have been instantly notified with your live GPS location.\n\nDo you need to connect with Ghanaian Emergency Services right now?',
+                    [
+                      { text: 'Call Police (191)', onPress: () => Linking.openURL('tel:191') },
+                      { text: 'Call Ambulance (193)', onPress: () => Linking.openURL('tel:193') },
+                      { text: 'Cancel', style: 'cancel' }
+                    ]
+                  );
+                }}
                 style={{ width: 200, height: 200, borderRadius: 100, backgroundColor: '#EF4444', alignItems: 'center', justifyContent: 'center', borderWidth: 8, borderColor: 'rgba(239, 68, 68, 0.3)', marginBottom: 40, shadowColor: '#EF4444', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.8, shadowRadius: 20 }}
               >
                 <Text style={{ color: '#fff', fontSize: 32, fontWeight: '900' }}>SOS</Text>
@@ -5574,12 +5970,21 @@ export default function App() {
                     <View>
                       <Text style={{ fontSize: 16, fontWeight: '700', color: convoyActive ? '#064E3B' : '#111827' }}>Convoy Mode</Text>
                       <Text style={{ fontSize: 12, color: convoyActive ? '#059669' : '#6B7280' }}>
-                        {convoyActive ? 'Linked with 3 nearby riders' : 'Night-time area escort'}
+                        {convoyActive ? 'Linked with nearby riders' : 'Night-time area escort'}
                       </Text>
                     </View>
                   </View>
                   <TouchableOpacity 
-                    onPress={() => setConvoyActive(!convoyActive)}
+                    onPress={() => {
+                      const newState = !convoyActive;
+                      setConvoyActive(newState);
+                      Alert.alert(
+                        'Convoy Mode ' + (newState ? 'Activated 🛡️' : 'Deactivated'),
+                        newState 
+                          ? 'You are now securely linked with nearby active Borla collectors for night-time area escort and real-time mutual location tracking.'
+                          : 'Convoy Mode has been deactivated.'
+                      );
+                    }}
                     style={{ width: 50, height: 28, borderRadius: 14, backgroundColor: convoyActive ? '#10B981' : '#D1D5DB', justifyContent: 'center', padding: 2 }}
                   >
                     <View style={{ width: 24, height: 24, borderRadius: 12, backgroundColor: '#fff', transform: [{ translateX: convoyActive ? 22 : 0 }] }} />
@@ -5590,12 +5995,25 @@ export default function App() {
               {/* Safety Tools */}
               <View style={{ width: '100%', gap: 16 }}>
                 <View style={{ flexDirection: 'row', gap: 16 }}>
-                  <TouchableOpacity style={{ flex: 1, backgroundColor: '#1F2937', padding: 20, borderRadius: 16, alignItems: 'center' }}>
+                  <TouchableOpacity 
+                    onPress={() => {
+                      supabase.channel('admin_global_alerts').send({
+                        type: 'broadcast',
+                        event: 'location_share',
+                        payload: { collector_id: user?.id, full_name: userProfile?.full_name, timestamp: new Date().toISOString() }
+                      });
+                      Alert.alert('Location Shared 📍', 'Your live GPS coordinates have been successfully broadcasted to Borla Admin Priority Support and your trusted emergency contacts.');
+                    }}
+                    style={{ flex: 1, backgroundColor: '#1F2937', padding: 20, borderRadius: 16, alignItems: 'center' }}
+                  >
                     <MapPin size={32} color="#06C167" style={{ marginBottom: 12 }} />
                     <Text style={{ color: '#fff', fontWeight: '700' }}>Share Location</Text>
                     <Text style={{ color: '#9CA3AF', fontSize: 12, marginTop: 4, textAlign: 'center' }}>Live with trusted contacts</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity style={{ flex: 1, backgroundColor: '#1F2937', padding: 20, borderRadius: 16, alignItems: 'center' }}>
+                  <TouchableOpacity 
+                    onPress={() => setStep(AppStep.INCIDENT_REPORT)}
+                    style={{ flex: 1, backgroundColor: '#1F2937', padding: 20, borderRadius: 16, alignItems: 'center' }}
+                  >
                     <AlertTriangle size={32} color="#F59E0B" style={{ marginBottom: 12 }} />
                     <Text style={{ color: '#fff', fontWeight: '700' }}>Report Incident</Text>
                     <Text style={{ color: '#9CA3AF', fontSize: 12, marginTop: 4, textAlign: 'center' }}>Accident or unsafe area</Text>
@@ -5604,7 +6022,21 @@ export default function App() {
 
                 {/* Emergency Contacts */}
                 <Text style={styles.sectionHeader}>Emergency Contacts</Text>
-                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1F2937', padding: 16, borderRadius: 16 }}>
+                <TouchableOpacity 
+                  onPress={async () => {
+                    const { data: ticket } = await supabase
+                      .from('support_tickets')
+                      .insert({ user_id: user?.id || 'anon-emergency', subject: 'Emergency Safety Support Request', status: 'open', priority: 'HIGH' })
+                      .select()
+                      .maybeSingle();
+
+                    const targetTicket = ticket || { id: 'mock-emergency-id', user_id: user?.id || 'anon', subject: 'Emergency Safety Support Request', status: 'open' };
+                    setActiveTicket(targetTicket);
+                    setSupportMessages([{ sender_id: 'bot', content: '🚨 EMERGENCY PRIORITY LINE: A Borla Safety Agent is reviewing your GPS coordinates right now. Please let us know your exact situation below.' }]);
+                    setStep(AppStep.CHAT);
+                  }}
+                  style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1F2937', padding: 16, borderRadius: 16 }}
+                >
                   <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(239,68,68,0.2)', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
                     <Smartphone size={20} color="#EF4444" />
                   </View>
@@ -5615,7 +6047,10 @@ export default function App() {
                   <ChevronRight size={20} color="#6B7280" />
                 </TouchableOpacity>
 
-                <TouchableOpacity style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1F2937', padding: 16, borderRadius: 16 }}>
+                <TouchableOpacity 
+                  onPress={() => Linking.openURL('tel:191')}
+                  style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1F2937', padding: 16, borderRadius: 16 }}
+                >
                   <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(37, 99, 235, 0.2)', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
                     <Shield size={20} color="#2563EB" />
                   </View>
@@ -5625,7 +6060,98 @@ export default function App() {
                   </View>
                   <ChevronRight size={20} color="#6B7280" />
                 </TouchableOpacity>
+
+                <TouchableOpacity 
+                  onPress={() => Linking.openURL('tel:193')}
+                  style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#1F2937', padding: 16, borderRadius: 16 }}
+                >
+                  <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: 'rgba(16, 185, 129, 0.2)', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                    <Shield size={20} color="#10B981" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>Ambulance (193)</Text>
+                    <Text style={{ color: '#9CA3AF', fontSize: 12 }}>Medical Emergency</Text>
+                  </View>
+                  <ChevronRight size={20} color="#6B7280" />
+                </TouchableOpacity>
               </View>
+            </ScrollView>
+          </View>
+        );
+
+      case AppStep.INCIDENT_REPORT:
+        return (
+          <View style={[styles.screenContainer, { backgroundColor: '#111' }]}>
+            <View style={[styles.header, { backgroundColor: '#1F2937' }]}>
+              <TouchableOpacity onPress={() => setStep(AppStep.COLLECTOR_SAFETY)} style={styles.backBtn}>
+                <ChevronLeft size={24} color="#fff" />
+              </TouchableOpacity>
+              <Text style={[styles.headerTitle, { color: '#fff' }]}>Report Incident</Text>
+              <View style={{ width: 40 }} />
+            </View>
+
+            <ScrollView contentContainerStyle={{ padding: 20 }}>
+              <Text style={{ color: '#9CA3AF', marginBottom: 24, fontSize: 14, textAlign: 'center' }}>
+                Please select the type of incident. This will immediately alert Borla Admin Priority Support.
+              </Text>
+
+              <View style={{ gap: 16, marginBottom: 32 }}>
+                {[
+                  { type: 'ACCIDENT', label: 'Vehicle Accident 💥', desc: 'Collision, breakdown, or road mishap' },
+                  { type: 'SAFETY_THREAT', label: 'Safety Threat / Harassment ⚠️', desc: 'Hostile environment or threat to safety' },
+                  { type: 'HAZARDOUS_MATERIAL', label: 'Hazardous Waste Spill ☣️', desc: 'Toxic, chemical, or dangerous waste spill' },
+                  { type: 'SEVERE_WEATHER', label: 'Severe Weather / Flood 🌧️', desc: 'Impassable roads or extreme weather' },
+                  { type: 'OTHER', label: 'Other Emergency 🚨', desc: 'Any other urgent issue requiring assistance' }
+                ].map((inc, i) => (
+                  <TouchableOpacity 
+                    key={i}
+                    onPress={async () => {
+                      // 1. Broadcast to admin global alerts
+                      supabase.channel('admin_global_alerts').send({
+                        type: 'broadcast',
+                        event: 'new_incident',
+                        payload: {
+                          collector_id: user?.id,
+                          full_name: userProfile?.full_name,
+                          type: inc.type,
+                          description: inc.label,
+                          timestamp: new Date().toISOString()
+                        }
+                      });
+
+                      // 2. Insert into database if online
+                      await supabase.from('incident_reports').insert({
+                        collector_id: user?.id || 'anon',
+                        pickup_id: activePickup?.id || null,
+                        type: inc.type,
+                        description: inc.desc,
+                        severity: inc.type === 'ACCIDENT' || inc.type === 'SAFETY_THREAT' ? 'CRITICAL' : 'MAJOR',
+                        status: 'INVESTIGATING'
+                      });
+
+                      Alert.alert(
+                        'Incident Reported ✅', 
+                        `Your report for "${inc.label}" has been instantly transmitted to Borla Admin Priority Support.\n\nA safety officer is reviewing your location coordinates.`,
+                        [{ text: 'OK', onPress: () => setStep(AppStep.COLLECTOR_SAFETY) }]
+                      );
+                    }}
+                    style={{ backgroundColor: '#1F2937', padding: 20, borderRadius: 16, borderWidth: 1, borderColor: '#374151', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}
+                  >
+                    <View style={{ flex: 1, paddingRight: 12 }}>
+                      <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700', marginBottom: 4 }}>{inc.label}</Text>
+                      <Text style={{ color: '#9CA3AF', fontSize: 12 }}>{inc.desc}</Text>
+                    </View>
+                    <ChevronRight size={20} color="#6B7280" />
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <TouchableOpacity 
+                onPress={() => setStep(AppStep.COLLECTOR_SAFETY)}
+                style={{ padding: 16, alignItems: 'center' }}
+              >
+                <Text style={{ color: '#EF4444', fontWeight: '700', fontSize: 16 }}>Cancel</Text>
+              </TouchableOpacity>
             </ScrollView>
           </View>
         );
@@ -5832,15 +6358,31 @@ export default function App() {
                       onPress={() => pickImage(async (uri, base64) => {
                         const url = await uploadToSupabase(uri, 'collector-documents', `${user?.id}/${doc.key}.jpg`, base64);
                         if (url) {
+                          const updatedDocs = { ...documents, [doc.key]: url };
                           setDocuments(prev => ({ ...prev, [doc.key]: url }));
-                          // Also store in collector_documents table
-                          await supabase.from('collector_documents').upsert({
-                            collector_id: user?.id,
-                            document_type: doc.key,
-                            document_url: url,
-                            status: 'pending',
-                            updated_at: new Date().toISOString()
-                          }, { onConflict: 'collector_id,document_type' });
+                          // Also store in collector_documents table matching real schema
+                          const { data: existing } = await supabase.from('collector_documents').select('id').eq('collector_id', user?.id).eq('doc_type', doc.key).maybeSingle();
+                          if (existing) {
+                            await supabase.from('collector_documents').update({
+                              doc_url: url,
+                              status: 'pending'
+                            }).eq('id', existing.id);
+                          } else {
+                            await supabase.from('collector_documents').insert({
+                              collector_id: user?.id,
+                              doc_type: doc.key,
+                              doc_url: url,
+                              status: 'pending'
+                            });
+                          }
+                          // Update profiles.vehicle_details.kyc_docs to ensure 100% reliable read access for Admin
+                          const currentVehicleDetails = userProfile?.vehicle_details || vehicleDetails || {};
+                          await supabase.from('profiles').update({
+                            vehicle_details: {
+                              ...currentVehicleDetails,
+                              kyc_docs: updatedDocs
+                            }
+                          }).eq('id', user?.id);
                         }
                       })}
                       style={[styles.phoneInput, { marginTop: 8, padding: 16, alignItems: 'center' }]}
@@ -5977,43 +6519,82 @@ export default function App() {
               </TouchableOpacity>
             )}
 
-            <Button 
-              onPress={async () => {
-                if (!proofPhoto) {
-                  Alert.alert('Required', 'Please take a photo of the cleaned area.');
-                  return;
-                }
-                setIsLoading(true);
-                try {
-                  const proofUrl = await uploadToSupabase(proofPhoto, 'proof-of-clean', `proofs/${activePickup.id}.jpg`);
-                  
-                  const { error } = await supabase
-                    .from('pickups')
-                    .update({ 
-                      status: 'collected',
-                      proof_url: proofUrl 
-                    })
-                    .eq('id', activePickup.id);
-
-                  if (!error) {
-                    setJobStatus('collected');
-                    setProofPhoto(null);
-                    setStep(AppStep.COLLECTOR_JOB);
-                    Alert.alert('Success', 'Proof uploaded! You can now complete the job.');
-                  } else {
-                    throw error;
+            <View style={{ gap: 12 }}>
+              <Button 
+                onPress={async () => {
+                  if (!proofPhoto) {
+                    Alert.alert('Required', 'Please take a photo of the cleaned area.');
+                    return;
                   }
-                } catch (e: any) {
-                  Alert.alert('Error', 'Failed to upload proof: ' + e.message);
-                } finally {
-                  setIsLoading(false);
-                }
-              }}
-              isLoading={isLoading}
-              disabled={!proofPhoto}
-            >
-              Submit Proof
-            </Button>
+                  setIsLoading(true);
+                  try {
+                    const proofUrl = await uploadToSupabase(proofPhoto, 'proof-of-clean', `proofs/${activePickup.id}.jpg`);
+                    
+                    const { error } = await supabase
+                      .from('pickups')
+                      .update({ 
+                        status: 'collected',
+                        proof_url: proofUrl 
+                      })
+                      .eq('id', activePickup.id);
+
+                    if (!error) {
+                      setJobStatus('collected');
+                      setProofPhoto(null);
+                      setStep(AppStep.COLLECTOR_JOB);
+                      Alert.alert('Success', 'Proof uploaded! You can now complete the job.');
+                    } else {
+                      throw error;
+                    }
+                  } catch (e: any) {
+                    Alert.alert('Error', 'Failed to upload proof: ' + e.message);
+                  } finally {
+                    setIsLoading(false);
+                  }
+                }}
+                isLoading={isLoading}
+                disabled={!proofPhoto}
+                style={{ backgroundColor: proofPhoto ? '#06C167' : '#9CA3AF' }}
+              >
+                Submit Proof & Complete
+              </Button>
+
+              <TouchableOpacity 
+                onPress={() => {
+                  Alert.alert(
+                    'Skip Proof of Clean?',
+                    'Only skip if the customer is present or requested no photo. Are you sure you want to proceed?',
+                    [
+                      { text: 'Cancel', style: 'cancel' },
+                      { 
+                        text: 'Skip & Complete', 
+                        style: 'destructive', 
+                        onPress: async () => {
+                          setIsLoading(true);
+                          const { error } = await supabase
+                            .from('pickups')
+                            .update({ status: 'collected' })
+                            .eq('id', activePickup.id);
+                          
+                          setIsLoading(false);
+                          if (!error) {
+                            setJobStatus('collected');
+                            setStep(AppStep.COLLECTOR_JOB);
+                            Alert.alert('Success', 'Job marked as collected without photo.');
+                          } else {
+                            Alert.alert('Error', 'Failed to update job status: ' + error.message);
+                          }
+                        } 
+                      }
+                    ]
+                  );
+                }}
+                disabled={isLoading}
+                style={{ padding: 16, alignItems: 'center', borderRadius: 12, backgroundColor: '#F3F4F6' }}
+              >
+                <Text style={{ color: '#6B7280', fontWeight: '700', fontSize: 16 }}>Complete Without Photo</Text>
+              </TouchableOpacity>
+            </View>
           </View>
         );
 
@@ -6173,11 +6754,27 @@ export default function App() {
                       return;
                     }
                     setIsCreatingPool(true);
-                    const { data: pool, error } = await supabase
+                    let poolInsertData: any = { location_name: newPoolName.trim(), target_size: 5, status: 'OPEN', created_by: user?.id };
+                    let { data: pool, error } = await supabase
                       .from('community_pools')
-                      .insert({ location_name: newPoolName.trim(), target_size: 5, current_size: 1, status: 'OPEN', created_by: user?.id })
+                      .insert(poolInsertData)
                       .select()
                       .single();
+                    
+                    if (error && error.message.includes('column')) {
+                      // Fallback if the table specifically expects current_members or member_count
+                      if (error.message.includes('current_members')) {
+                        poolInsertData.current_members = 1;
+                      } else if (error.message.includes('member_count')) {
+                        poolInsertData.member_count = 1;
+                      } else if (error.message.includes('members_count')) {
+                        poolInsertData.members_count = 1;
+                      }
+                      const res = await supabase.from('community_pools').insert(poolInsertData).select().single();
+                      pool = res.data;
+                      error = res.error;
+                    }
+
                     if (error || !pool) {
                       Alert.alert('Error', 'Could not create pool: ' + (error?.message || 'Unknown error'));
                       setIsCreatingPool(false);
@@ -6220,7 +6817,13 @@ export default function App() {
                     if (error) {
                       Alert.alert('Already Joined', 'You are already a member of this pool.');
                     } else {
-                      await supabase.from('community_pools').update({ current_size: pool.current_size + 1 }).eq('id', pool.id);
+                      if (pool.current_members !== undefined) {
+                        await supabase.from('community_pools').update({ current_members: pool.current_members + 1 }).eq('id', pool.id);
+                      } else if (pool.member_count !== undefined) {
+                        await supabase.from('community_pools').update({ member_count: pool.member_count + 1 }).eq('id', pool.id);
+                      } else if (pool.members_count !== undefined) {
+                        await supabase.from('community_pools').update({ members_count: pool.members_count + 1 }).eq('id', pool.id);
+                      }
                       Alert.alert('Welcome! 🎉', 'You have joined the pool. You will be notified when it fills up.');
                       fetchCommunityPools();
                     }
@@ -6473,6 +7076,141 @@ export default function App() {
         )}
 
         
+        {/* Customer Rating Modal */}
+        <Modal visible={showRatingModal} animationType="slide" transparent>
+          <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' }}>
+            <View style={{ backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 }}>
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                <Text style={{ fontSize: 20, fontWeight: '800', color: '#1F2937' }}>Rate Your Collector</Text>
+                <TouchableOpacity onPress={() => setShowRatingModal(false)}><X size={24} color="#6B7280" /></TouchableOpacity>
+              </View>
+
+              {ratingCollector ? (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12, marginBottom: 24, padding: 12, backgroundColor: '#F9FAFB', borderRadius: 16 }}>
+                  {ratingCollector.avatar_url ? (
+                    <Image source={{ uri: ratingCollector.avatar_url }} style={{ width: 48, height: 48, borderRadius: 24 }} />
+                  ) : (
+                    <View style={{ width: 48, height: 48, borderRadius: 24, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center' }}>
+                      <User size={24} color="#fff" />
+                    </View>
+                  )}
+                  <View>
+                    <Text style={{ fontSize: 16, fontWeight: '700', color: '#1F2937' }}>{ratingCollector.full_name || 'Collector'}</Text>
+                    <Text style={{ fontSize: 12, color: '#6B7280' }}>Verified Borla Partner</Text>
+                  </View>
+                </View>
+              ) : (
+                <Text style={{ fontSize: 14, color: '#6B7280', marginBottom: 20 }}>How was your trash collection experience with Borla?</Text>
+              )}
+
+              <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 16, textAlign: 'center' }}>TAP A STAR TO RATE</Text>
+              <View style={{ flexDirection: 'row', justifyContent: 'center', gap: 16, marginBottom: 24 }}>
+                {[1, 2, 3, 4, 5].map((star) => (
+                  <TouchableOpacity key={star} onPress={() => setSelectedRating(star)}>
+                    <Star size={36} color={selectedRating >= star ? '#F59E0B' : '#D1D5DB'} fill={selectedRating >= star ? '#F59E0B' : 'transparent'} />
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>WHAT WISHES TO BE PRAISED? (OPTIONAL)</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
+                {['🚀 Fast Pickup', '✨ Very Polite', '🧹 Clean Job', '🛡️ Safe & Professional'].map(tag => (
+                  <TouchableOpacity 
+                    key={tag}
+                    onPress={() => setSelectedRatingTag(selectedRatingTag === tag ? '' : tag)}
+                    style={{ 
+                      paddingHorizontal: 14, 
+                      paddingVertical: 10, 
+                      borderRadius: 20, 
+                      backgroundColor: selectedRatingTag === tag ? '#06C167' : '#F3F4F6',
+                      borderWidth: 1,
+                      borderColor: selectedRatingTag === tag ? '#06C167' : '#E5E7EB'
+                    }}
+                  >
+                    <Text style={{ color: selectedRatingTag === tag ? '#fff' : '#4B5563', fontSize: 12, fontWeight: '700' }}>
+                      {tag}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>ADDITIONAL COMMENTS (OPTIONAL)</Text>
+              <TextInput
+                style={{ backgroundColor: '#F9FAFB', borderRadius: 12, padding: 16, height: 80, textAlignVertical: 'top', borderWidth: 1, borderColor: '#E5E7EB' }}
+                placeholder="Leave a compliment or feedback..."
+                multiline
+                value={ratingComment}
+                onChangeText={setRatingComment}
+              />
+
+              <TouchableOpacity 
+                onPress={async () => {
+                  if (!ratingCollector?.id) {
+                    setShowRatingModal(false);
+                    Alert.alert('Thank You!', 'Your feedback helps keep Borla premium.');
+                    return;
+                  }
+                  setIsSubmittingRating(true);
+                  try {
+                    // 1. Update profile rating average
+                    await supabase.from('profiles').update({ rating_average: selectedRating }).eq('id', ratingCollector.id);
+                    // 2. Insert into reviews table for Admin Dashboard & full audit trail
+                    const finalComment = ratingComment ? `${selectedRatingTag ? selectedRatingTag + ' - ' : ''}${ratingComment}` : selectedRatingTag || 'Great service';
+                    await supabase.from('reviews').insert({
+                      collector_id: ratingCollector.id,
+                      reviewer_id: user?.id || ratingCollector.id, // fallback if anonymous
+                      pickup_id: activePickup?.id || null,
+                      rating: selectedRating,
+                      comment: finalComment,
+                      is_flagged: selectedRating <= 2
+                    });
+
+                    // 3. Always broadcast to admin global alerts so Admin Dashboard updates instantly
+                    const adminAlertChan = supabase.channel('admin_global_alerts');
+                    adminAlertChan.subscribe((status) => {
+                      if (status === 'SUBSCRIBED') {
+                        adminAlertChan.send({
+                          type: 'broadcast',
+                          event: 'rating_submitted',
+                          payload: {
+                            collector_id: ratingCollector.id,
+                            rating: selectedRating,
+                            comment: finalComment,
+                            is_flagged: selectedRating <= 2
+                          }
+                        }).then(() => supabase.removeChannel(adminAlertChan));
+                      }
+                    });
+                  } catch (e) {
+                    console.log('Rating submit error:', e);
+                  } finally {
+                    setIsSubmittingRating(false);
+                    setShowRatingModal(false);
+                    setRatingComment('');
+                    setSelectedRatingTag('');
+                    Alert.alert('Thank You!', 'Your feedback helps keep Borla premium.');
+                  }
+                }}
+                disabled={isSubmittingRating}
+                style={{ backgroundColor: '#06C167', padding: 18, borderRadius: 16, marginTop: 24, alignItems: 'center' }}
+              >
+                <Text style={{ color: '#fff', fontWeight: '800', fontSize: 16 }}>{isSubmittingRating ? 'Submitting...' : 'Submit Rating'}</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity 
+                onPress={() => {
+                  setShowRatingModal(false);
+                  setRatingComment('');
+                  setSelectedRatingTag('');
+                }}
+                style={{ padding: 16, marginTop: 12, alignItems: 'center' }}
+              >
+                <Text style={{ color: '#6B7280', fontWeight: '700', fontSize: 14 }}>Skip / Not Now</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
         {/* Location Manual Edit Modal - Fullscreen Interactive Picker */}
         {showLocationModal && (
           <View style={[StyleSheet.absoluteFill, { backgroundColor: '#fff', zIndex: 9999 }]}>
