@@ -36,6 +36,7 @@ export const MapComponent: React.FC<MapComponentProps> = ({
   collectors = [],
   showRoute = false,
   showHeatmap = false,
+  onRegionChange,
 }) => {
   const webViewRef = useRef<WebView>(null);
   const centerLat = userLatitude ?? DEFAULT_LAT;
