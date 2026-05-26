@@ -129,7 +129,10 @@ export const MapComponent: React.FC<MapComponentProps> = ({
       attributionControl: false,
     }).setView([${centerLat}, ${centerLng}], 14);
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+      maxZoom: 20,
+      subdomains: 'abcd'
+    }).addTo(map);
 
     map.on('moveend', function() {
       const center = map.getCenter();

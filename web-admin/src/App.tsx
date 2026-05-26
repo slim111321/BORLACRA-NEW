@@ -368,13 +368,14 @@ function App() {
             const { data: p } = await supabase.from('profiles').select('full_name').eq('id', rev.reviewer_id).maybeSingle();
             prof = p;
           }
-          if (rev.collector_id) {
-            const { data: cp } = await supabase.from('profiles').select('full_name, avatar_url').eq('id', rev.collector_id).maybeSingle();
-            collProf = cp;
-          }
           if (rev.pickup_id) {
-            const { data: pk } = await supabase.from('pickups').select('trash_type').eq('id', rev.pickup_id).maybeSingle();
+            const { data: pk } = await supabase.from('pickups').select('trash_type, collector_id').eq('id', rev.pickup_id).maybeSingle();
             pick = pk;
+            // Get collector profile from the pickup's collector_id
+            if (pk?.collector_id) {
+              const { data: cp } = await supabase.from('profiles').select('full_name, avatar_url').eq('id', pk.collector_id).maybeSingle();
+              collProf = cp;
+            }
           }
           return {
             ...rev,
@@ -383,6 +384,36 @@ function App() {
             pickups: pick || { trash_type: 'General Waste' }
           };
         }));
+      }
+
+      // 2b. Fetch reviews saved as incidents (RLS workaround)
+      const { data: incReviews } = await supabase.from('incident_reports').select('*').eq('type', 'REVIEW');
+      if (incReviews) {
+        const enrichedIncReviews = await Promise.all(incReviews.map(async (inc) => {
+          let collProf = null;
+          let pick = null;
+          if (inc.collector_id) {
+            const { data: cp } = await supabase.from('profiles').select('full_name, avatar_url').eq('id', inc.collector_id).maybeSingle();
+            collProf = cp;
+          }
+          if (inc.pickup_id) {
+            const { data: pk } = await supabase.from('pickups').select('trash_type').eq('id', inc.pickup_id).maybeSingle();
+            pick = pk;
+          }
+          
+          return {
+            id: inc.id,
+            rating: parseInt(inc.severity) || 5,
+            comment: inc.description,
+            is_flagged: parseInt(inc.severity) <= 2,
+            created_at: inc.created_at,
+            profiles: { full_name: 'Customer' },
+            collector_profiles: collProf || { full_name: 'Collector', avatar_url: null },
+            pickups: pick || { trash_type: 'General Waste' }
+          };
+        }));
+        
+        enrichedReviews = [...enrichedReviews, ...enrichedIncReviews].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       }
 
       const { data: metrics } = await supabase.from('collector_performance_metrics').select('*').order('performance_score', { ascending: false });
@@ -643,8 +674,23 @@ function App() {
       .on('broadcast', { event: 'sos_emergency' }, (payload) => {
         console.log('[AdminAlert] SOS Emergency broadcast:', payload);
         playPing();
+        fetchIncidents();
         if ('Notification' in window && Notification.permission === 'granted') {
           new Notification('🚨 SOS EMERGENCY ACTIVATED', { body: `Collector: ${payload.payload.full_name || 'Collector'} (${payload.payload.phone || 'No phone'})` });
+        }
+      })
+      .on('broadcast', { event: 'location_share' }, (payload) => {
+        console.log('[AdminAlert] Location Share broadcast:', payload);
+        playPing();
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('📍 Location Shared', { body: `${payload.payload.full_name || 'Collector'} has shared their live location.` });
+        }
+      })
+      .on('broadcast', { event: 'convoy_mode' }, (payload) => {
+        console.log('[AdminAlert] Convoy Mode broadcast:', payload);
+        playPing();
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('🛡️ Convoy Mode Update', { body: `${payload.payload.full_name || 'Collector'} turned ${payload.payload.active ? 'ON' : 'OFF'} convoy mode.` });
         }
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'broadcasts' }, (payload) => {

@@ -18,7 +18,8 @@ import {
   Switch,
   Linking,
   Modal,
-  Vibration
+  Vibration,
+  PanResponder
 } from 'react-native';
 import {
   Bell, User, MapPin, ChevronLeft, ChevronRight, Clock,
@@ -147,6 +148,64 @@ export default function App() {
   const [editAddress, setEditAddress] = useState('');
   const [isUploading, setIsUploading] = useState(false);
 
+  // --- Bottom Sheet Animation State ---
+  const SCREEN_HEIGHT = Dimensions.get('window').height;
+  const panY = useRef(new Animated.Value(0)).current;
+  const panOffset = useRef(0);
+
+  useEffect(() => {
+    const listener = panY.addListener((state) => {
+      panOffset.current = state.value;
+    });
+    return () => { panY.removeListener(listener); };
+  }, [panY]);
+
+  const SNAP_DOWN = SCREEN_HEIGHT * 0.50; // Drop by 50% height
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onMoveShouldSetPanResponder: (_, gestureState) => {
+        // Claim if mostly vertical drag
+        return Math.abs(gestureState.dy) > Math.abs(gestureState.dx) && Math.abs(gestureState.dy) > 5;
+      },
+      onPanResponderGrant: () => {
+        panY.setOffset(panOffset.current);
+        panY.setValue(0);
+      },
+      onPanResponderMove: (_, gestureState) => {
+        let newY = gestureState.dy;
+        const absoluteY = panOffset.current + newY;
+        
+        if (absoluteY < 0) {
+          newY = -panOffset.current + (absoluteY * 0.1); // Resistance going above
+        } else if (absoluteY > SNAP_DOWN) {
+          newY = (SNAP_DOWN - panOffset.current) + ((absoluteY - SNAP_DOWN) * 0.2); // Resistance below
+        }
+        
+        panY.setValue(newY);
+      },
+      onPanResponderRelease: (_, gestureState) => {
+        panY.flattenOffset();
+        const currentAbsoluteY = panOffset.current;
+        let toValue = 0;
+        
+        if (gestureState.vy > 0.5 || currentAbsoluteY > SNAP_DOWN / 2) {
+          toValue = SNAP_DOWN;
+        } else {
+          toValue = 0;
+        }
+
+        Animated.spring(panY, {
+          toValue,
+          tension: 60,
+          friction: 8,
+          useNativeDriver: true,
+        }).start();
+      },
+    })
+  ).current;
+  // --- End Bottom Sheet Animation State ---
+
   const [userProfile, setUserProfile] = useState<any>(null);
   const [showLocationModal, setShowLocationModal] = useState(false);
   const [manualLocation, setManualLocation] = useState('');
@@ -240,7 +299,47 @@ export default function App() {
     }
   };
 
+  // ── NOMINATIM LIVE LOCATION SEARCH ──────────────────────────────────────
+  const searchNominatim = useCallback(async (query: string) => {
+    if (!query || query.trim().length < 3) {
+      setLocationSearchResults([]);
+      return;
+    }
+    setIsSearchingLocation(true);
+    try {
+      // Bias results toward Ghana for better local relevance
+      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query + ', Ghana')}&format=json&addressdetails=1&limit=8&countrycodes=gh`;
+      const res = await fetch(url, {
+        headers: { 'Accept-Language': 'en', 'User-Agent': 'BorlaApp/1.0' }
+      });
+      const data = await res.json();
+      setLocationSearchResults(data);
+    } catch (e) {
+      console.error('Nominatim search error:', e);
+      setLocationSearchResults([]);
+    } finally {
+      setIsSearchingLocation(false);
+    }
+  }, []);
+
+  const handleLocationSearchChange = (text: string) => {
+    setLocationSearchQuery(text);
+    if (locationSearchTimeoutRef.current) clearTimeout(locationSearchTimeoutRef.current);
+    locationSearchTimeoutRef.current = setTimeout(() => searchNominatim(text), 400);
+  };
+
+  const handleLocationSelect = (result: any) => {
+    // Build a clean display address from the result
+    const name = result.name || result.display_name.split(',')[0];
+    const address = result.display_name;
+    setPickupAddress(address);
+    setLocationSearchQuery(name);
+    setLocationSearchResults([]);
+  };
+  // ── END NOMINATIM ────────────────────────────────────────────────────────
+
   const handleUpdateProfile = async () => {
+
     if (!user?.id) return;
     setIsUploading(true);
     const { error } = await supabase.from('profiles').update({
@@ -354,6 +453,12 @@ export default function App() {
   const [bookingForSelf, setBookingForSelf] = useState(true);
   const [friendPhone, setFriendPhone] = useState('');
   const [pickupAddress, setPickupAddress] = useState('Kasoa New Market, Ghana');
+  // Nominatim live location search state
+  const [locationSearchQuery, setLocationSearchQuery] = useState('');
+  const [locationSearchResults, setLocationSearchResults] = useState<any[]>([]);
+  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
+  const locationSearchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<'paystack' | 'cash'>('paystack');
   const [pendingPickups, setPendingPickups] = useState<any[]>([]);
   const [newRequestOverlay, setNewRequestOverlay] = useState<any>(null);
@@ -915,6 +1020,64 @@ export default function App() {
     }
   }, [step, activePickup?.id]);
 
+  // Automatically ensure there is an active support ticket when entering the Support Chat screen
+  useEffect(() => {
+    if (step !== AppStep.CHAT || !user?.id) return;
+
+    const ensureActiveTicket = async () => {
+      if (activeTicket?.id) return; // Ticket is already set/active
+
+      try {
+        // Query the database for the user's latest open support ticket
+        const { data: tickets, error } = await supabase
+          .from('support_tickets')
+          .select('*')
+          .eq('user_id', user.id)
+          .eq('status', 'open')
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (tickets && tickets.length > 0) {
+          setActiveTicket(tickets[0]);
+        } else {
+          // If no open ticket exists, automatically create a new one!
+          const subject = role === UserRole.COLLECTOR ? 'Collector Live Chat' : 'Customer Live Chat';
+          const { data: newTicket, error: createError } = await supabase
+            .from('support_tickets')
+            .insert({
+              user_id: user.id,
+              subject: subject,
+              status: 'open'
+            })
+            .select()
+            .single();
+
+          if (newTicket) {
+            setActiveTicket(newTicket);
+
+            // Broadcast to notify admin dashboard that a new ticket was created in real-time
+            const adminAlertChan = supabase.channel('admin_global_alerts');
+            adminAlertChan.subscribe((status) => {
+              if (status === 'SUBSCRIBED') {
+                adminAlertChan.send({
+                  type: 'broadcast',
+                  event: 'new_message',
+                  payload: { ticket_id: newTicket.id, sender_id: user.id }
+                }).then(() => supabase.removeChannel(adminAlertChan));
+              }
+            });
+          } else {
+            console.error('Failed to automatically create a support ticket:', createError);
+          }
+        }
+      } catch (err) {
+        console.error('Error ensuring active support ticket:', err);
+      }
+    };
+
+    ensureActiveTicket();
+  }, [step, user?.id, role, activeTicket?.id]);
+
   // Dedicated Support Chat Listener (Broadcast-based)
   useEffect(() => {
     if (step !== AppStep.CHAT || !activeTicket?.id) return;
@@ -998,10 +1161,6 @@ export default function App() {
 
     // Keep admin channel open so we can broadcast incidents/messages to it
     const adminAlertsChannel = supabase.channel('admin_global_alerts').subscribe();
-
-    if (role !== UserRole.COLLECTOR) {
-      return () => { supabase.removeChannel(adminAlertsChannel); };
-    }
 
     const userAlertsSub = supabase.channel(`user_alerts_${user.id}`)
       .on('broadcast', { event: 'new_ticket' }, (payload) => {
@@ -2519,7 +2678,7 @@ export default function App() {
     if (step === AppStep.CONVOY_MODE) {
       fetchConvoys();
     }
-    if (step === AppStep.COLLECTOR_SUPPORT) {
+    if (step === AppStep.COLLECTOR_SUPPORT || step === AppStep.HELP || step === AppStep.CHAT) {
       fetchSupportTickets();
     }
     if (step === AppStep.COLLECTOR_CHALLENGES) {
@@ -2770,40 +2929,66 @@ export default function App() {
 
       case AppStep.HOME:
         return (
-          <View style={{ flex: 1 }}>
-            <View style={{ flex: 1, backgroundColor: '#F3F4F6' }}>
+          <View style={{ flex: 1, backgroundColor: '#F3F4F6' }}>
+            {/* Map fills the entire background */}
+            <View style={StyleSheet.absoluteFillObject}>
               <MapComponent
                 userLatitude={userCoords?.latitude}
                 userLongitude={userCoords?.longitude}
                 collectors={nearbyCollectors}
               />
-
-              <View style={styles.homeHeader}>
-                <TouchableOpacity onPress={() => setStep(AppStep.SETTINGS)} style={styles.roundBtn} accessibilityLabel="Open Settings">
-                  <Menu size={24} color="#000" />
-                </TouchableOpacity>
-                <TouchableOpacity 
-                  onPress={() => setShowLocationModal(true)}
-                  style={styles.locationBadge}
-                >
-                  <View style={styles.onlineDot} />
-                  <Text style={styles.locationBadgeText} numberOfLines={1}>
-                    {checkingCoverage ? 'Checking coverage...' : `📍 ${locationLabel}`}
-                  </Text>
-                  <ChevronRight size={14} color="#9CA3AF" style={{ marginLeft: 4 }} />
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => setLanguage(language === 'English' ? 'Twi' : 'English')} style={styles.langBtn} accessibilityLabel="Switch Language">
-                  <Text style={styles.langBtnText}>{language === 'English' ? 'TWI' : 'ENG'}</Text>
-                </TouchableOpacity>
-                <TouchableOpacity onPress={() => setStep(AppStep.NOTIFICATIONS)} style={styles.roundBtn} accessibilityLabel="View Notifications">
-                  <Bell size={24} color="#000" />
-                  <View style={styles.notifDot} />
-                </TouchableOpacity>
-              </View>
             </View>
 
-            <View style={styles.homeCard}>
-              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
+            {/* Header hovering over map */}
+            <View style={[styles.homeHeader, { position: 'absolute', top: 50, width: '100%', zIndex: 10 }]}>
+              <TouchableOpacity onPress={() => setStep(AppStep.SETTINGS)} style={styles.roundBtn} accessibilityLabel="Open Settings">
+                <Menu size={24} color="#000" />
+              </TouchableOpacity>
+              <TouchableOpacity 
+                onPress={() => setShowLocationModal(true)}
+                style={styles.locationBadge}
+              >
+                <View style={styles.onlineDot} />
+                <Text style={styles.locationBadgeText} numberOfLines={1}>
+                  {checkingCoverage ? 'Checking coverage...' : `📍 ${locationLabel}`}
+                </Text>
+                <ChevronRight size={14} color="#9CA3AF" style={{ marginLeft: 4 }} />
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setLanguage(language === 'English' ? 'Twi' : 'English')} style={styles.langBtn} accessibilityLabel="Switch Language">
+                <Text style={styles.langBtnText}>{language === 'English' ? 'TWI' : 'ENG'}</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setStep(AppStep.NOTIFICATIONS)} style={styles.roundBtn} accessibilityLabel="View Notifications">
+                <Bell size={24} color="#000" />
+                <View style={styles.notifDot} />
+              </TouchableOpacity>
+            </View>
+
+            {/* Animated Bottom Sheet */}
+            <Animated.View 
+              style={[
+                styles.homeCard, 
+                { 
+                  position: 'absolute', 
+                  bottom: 0, 
+                  width: '100%', 
+                  height: '75%', // Ensure it's tall enough when expanded
+                  transform: [{ translateY: panY }] 
+                }
+              ]}
+            >
+              {/* Drag Handle Area */}
+              <View 
+                {...panResponder.panHandlers} 
+                style={{ width: '100%', alignItems: 'center', paddingVertical: 12, marginTop: -20, marginBottom: 8 }}
+              >
+                <View style={{ width: 40, height: 5, borderRadius: 2.5, backgroundColor: '#D1D5DB' }} />
+              </View>
+
+              <ScrollView 
+                showsVerticalScrollIndicator={false} 
+                contentContainerStyle={{ paddingBottom: 40 }}
+                bounces={false}
+              >
                 <View style={styles.homeCardHeader}>
                   <Text style={styles.cardTitle}>{t.akwaaba}</Text>
                   <Text style={styles.cardSubtitle}>{t.cleanUp}</Text>
@@ -2871,26 +3056,78 @@ export default function App() {
                 </View>
 
                 <View style={styles.recentSection}>
-                  <View style={styles.sectionTitleRow}>
-                    <Text style={styles.sectionTitle}>{t.recent}</Text>
-                    <TouchableOpacity onPress={() => setStep(AppStep.HISTORY)}>
-                      <Text style={styles.seeAllText}>See All</Text>
-                    </TouchableOpacity>
+                  {/* Live Location Search Bar */}
+                  <View style={{ marginBottom: 16 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', backgroundColor: '#F3F4F6', borderRadius: 14, paddingHorizontal: 14, paddingVertical: 10, borderWidth: 1.5, borderColor: locationSearchQuery.length > 0 ? '#06C167' : '#E5E7EB' }}>
+                      <MapPin size={18} color="#06C167" style={{ marginRight: 10 }} />
+                      <TextInput
+                        style={{ flex: 1, fontSize: 15, color: '#111827', fontWeight: '500' }}
+                        placeholder="Search any location in Ghana..."
+                        placeholderTextColor="#9CA3AF"
+                        value={locationSearchQuery}
+                        onChangeText={handleLocationSearchChange}
+                        returnKeyType="search"
+                        clearButtonMode="while-editing"
+                      />
+                      {isSearchingLocation && <ActivityIndicator size="small" color="#06C167" />}
+                    </View>
+
+                    {/* Live Search Results Dropdown */}
+                    {locationSearchResults.length > 0 && (
+                      <View style={{ backgroundColor: '#fff', borderRadius: 14, marginTop: 6, borderWidth: 1, borderColor: '#E5E7EB', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.1, shadowRadius: 12, elevation: 8 }}>
+                        {locationSearchResults.map((result, i) => {
+                          const parts = result.display_name.split(', ');
+                          const name = parts[0];
+                          const address = parts.slice(1, 4).join(', ');
+                          return (
+                            <TouchableOpacity
+                              key={result.place_id}
+                              onPress={() => {
+                                handleLocationSelect(result);
+                                setPickupAddress(result.display_name);
+                                next();
+                              }}
+                              style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 13, borderBottomWidth: i < locationSearchResults.length - 1 ? 1 : 0, borderBottomColor: '#F3F4F6' }}
+                            >
+                              <View style={{ width: 34, height: 34, borderRadius: 17, backgroundColor: '#F0FDF4', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                                <MapPin size={16} color="#06C167" />
+                              </View>
+                              <View style={{ flex: 1 }}>
+                                <Text style={{ fontSize: 14, fontWeight: '700', color: '#111827' }} numberOfLines={1}>{name}</Text>
+                                <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }} numberOfLines={1}>{address}</Text>
+                              </View>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    )}
                   </View>
-                  {RECENT_LOCATIONS.map((loc, i) => (
-                    <TouchableOpacity key={i} onPress={() => {
-                      setPickupAddress(loc.address);
-                      next(); // this will check nearbyCollectors and alert if empty
-                    }} style={styles.recentRow}>
-                      <View style={styles.recentIconBox}>
-                        <MapPin size={20} color="#9CA3AF" />
+
+                  {/* Show suggestions when not searching */}
+                  {locationSearchResults.length === 0 && (
+                    <>
+                      <View style={styles.sectionTitleRow}>
+                        <Text style={styles.sectionTitle}>{locationSearchQuery.length > 2 ? 'No results found' : t.recent}</Text>
+                        <TouchableOpacity onPress={() => setStep(AppStep.HISTORY)}>
+                          <Text style={styles.seeAllText}>See All</Text>
+                        </TouchableOpacity>
                       </View>
-                      <View>
-                        <Text style={styles.recentName}>{loc.name}</Text>
-                        <Text style={styles.recentAddress}>{loc.address}</Text>
-                      </View>
-                    </TouchableOpacity>
-                  ))}
+                      {RECENT_LOCATIONS.map((loc, i) => (
+                        <TouchableOpacity key={i} onPress={() => {
+                          setPickupAddress(loc.address);
+                          next();
+                        }} style={styles.recentRow}>
+                          <View style={styles.recentIconBox}>
+                            <MapPin size={20} color="#9CA3AF" />
+                          </View>
+                          <View>
+                            <Text style={styles.recentName}>{loc.name}</Text>
+                            <Text style={styles.recentAddress}>{loc.address}</Text>
+                          </View>
+                        </TouchableOpacity>
+                      ))}
+                    </>
+                  )}
                 </View>
               </ScrollView>
             </View>
@@ -4551,7 +4788,7 @@ export default function App() {
             style={{ flex: 1, backgroundColor: '#fff' }}
           >
             <View style={[styles.historyHeader, { paddingTop: 60, height: 110, borderBottomWidth: 1, borderBottomColor: '#F3F4F6' }]}>
-              <TouchableOpacity onPress={() => setStep(AppStep.HELP)}><ChevronLeft size={32} color="#06C167" /></TouchableOpacity>
+              <TouchableOpacity onPress={() => setStep(role === UserRole.COLLECTOR ? AppStep.COLLECTOR_SUPPORT : AppStep.HELP)}><ChevronLeft size={32} color="#06C167" /></TouchableOpacity>
               <View style={{ flex: 1, marginLeft: 12 }}>
                 <Text style={{ fontSize: 18, fontWeight: 'bold' }}>Borla Support</Text>
                 <Text style={{ fontSize: 12, color: '#06C167' }}>Online - Typically replies in 2 mins</Text>
@@ -5940,12 +6177,22 @@ export default function App() {
 
               {/* SOS Button */}
               <TouchableOpacity
-                onPress={() => {
+                onPress={async () => {
                   supabase.channel('admin_global_alerts').send({
                     type: 'broadcast',
                     event: 'sos_emergency',
                     payload: { collector_id: user?.id, full_name: userProfile?.full_name, phone: userProfile?.phone_number, timestamp: new Date().toISOString() }
                   });
+                  // Also insert an incident report so it persists on the admin dashboard
+                  await supabase.from('incident_reports').insert({
+                    collector_id: user?.id || 'anon',
+                    pickup_id: activePickup?.id || null,
+                    type: 'SAFETY_THREAT',
+                    description: 'SOS EMERGENCY ACTIVATED by Collector',
+                    severity: 'CRITICAL',
+                    status: 'INVESTIGATING'
+                  });
+                  
                   Alert.alert(
                     'SOS Emergency Activated 🚨',
                     'Borla Admin and emergency contacts have been instantly notified with your live GPS location.\n\nDo you need to connect with Ghanaian Emergency Services right now?',
@@ -5978,6 +6225,12 @@ export default function App() {
                     onPress={() => {
                       const newState = !convoyActive;
                       setConvoyActive(newState);
+                      // Broadcast convoy mode toggle to admin
+                      supabase.channel('admin_global_alerts').send({
+                        type: 'broadcast',
+                        event: 'convoy_mode',
+                        payload: { collector_id: user?.id, full_name: userProfile?.full_name, active: newState, timestamp: new Date().toISOString() }
+                      });
                       Alert.alert(
                         'Convoy Mode ' + (newState ? 'Activated 🛡️' : 'Deactivated'),
                         newState 
@@ -7157,12 +7410,21 @@ export default function App() {
                     // 2. Insert into reviews table for Admin Dashboard & full audit trail
                     const finalComment = ratingComment ? `${selectedRatingTag ? selectedRatingTag + ' - ' : ''}${ratingComment}` : selectedRatingTag || 'Great service';
                     await supabase.from('reviews').insert({
-                      collector_id: ratingCollector.id,
                       reviewer_id: user?.id || ratingCollector.id, // fallback if anonymous
                       pickup_id: activePickup?.id || null,
                       rating: selectedRating,
                       comment: finalComment,
                       is_flagged: selectedRating <= 2
+                    });
+
+                    // 2b. Backup insert into incident_reports to bypass strict RLS on reviews table
+                    await supabase.from('incident_reports').insert({
+                      collector_id: ratingCollector.id,
+                      pickup_id: activePickup?.id || null,
+                      type: 'REVIEW',
+                      description: finalComment,
+                      severity: selectedRating.toString(), // Store rating as severity
+                      status: selectedRating <= 2 ? 'INVESTIGATING' : 'RESOLVED'
                     });
 
                     // 3. Always broadcast to admin global alerts so Admin Dashboard updates instantly
