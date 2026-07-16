@@ -1,10 +1,10 @@
 const https = require('https');
+const { supabaseUrl, supabaseAnonKey } = require('./_env');
 
-const supabaseUrl = 'gmllzbdvmhygbedqgxgf.supabase.co';
-const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdtbGx6YmR2bWh5Z2JlZHFneGdmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njg5NDc2OTEsImV4cCI6MjA4NDUyMzY5MX0.5I1erA9sL5hIx6A8cDzhfFNnvStUll6NCqCGIq_Azao';
+const supabaseHost = supabaseUrl.replace(/^https?:\/\//, '');
 
 const options = {
-  hostname: supabaseUrl,
+  hostname: supabaseHost,
   path: '/rest/v1/',
   method: 'GET',
   headers: {

@@ -209,7 +209,6 @@ export default function App() {
   const [userProfile, setUserProfile] = useState<any>(null);
   const [showLocationModal, setShowLocationModal] = useState(false);
   const [manualLocation, setManualLocation] = useState('');
-  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
   const [pickerCenter, setPickerCenter] = useState<UserCoords | null>(null);
   
   const [collectorProfile, setCollectorProfile] = useState({
@@ -2867,27 +2866,6 @@ export default function App() {
                 Apple
               </Button>
             </View>
-
-            <View style={{ marginTop: 32, padding: 20, backgroundColor: '#F3F4F6', borderRadius: 16, width: '100%' }}>
-              <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 16, textAlign: 'center' }}>Demo / Quick Login (Skip Auth)</Text>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <TouchableOpacity 
-                  onPress={() => { setRole(UserRole.CUSTOMER); setStep(AppStep.HOME); }}
-                  style={{ flex: 1, backgroundColor: '#06C167', paddingVertical: 10, borderRadius: 8, alignItems: 'center' }}
-                >
-                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: 'bold' }}>Customer</Text>
-                </TouchableOpacity>
-                <TouchableOpacity 
-                  onPress={() => {
-                    setRole(UserRole.COLLECTOR);
-                    setStep(AppStep.COLLECTOR_DASHBOARD);
-                  }}
-                  style={{ flex: 1, backgroundColor: '#1F2937', paddingVertical: 10, borderRadius: 8, alignItems: 'center' }}
-                >
-                  <Text style={{ color: '#fff', fontSize: 12, fontWeight: 'bold' }}>Collector</Text>
-                </TouchableOpacity>
-              </View>
-            </View>
           </KeyboardAvoidingView>
         );
 
@@ -3130,7 +3108,7 @@ export default function App() {
                   )}
                 </View>
               </ScrollView>
-            </View>
+            </Animated.View>
 
             <BottomNav activeStep={step} onTabChange={setStep} role={role} />
           </View>
@@ -4300,14 +4278,36 @@ export default function App() {
                 </Button>
                 <Button
                   onPress={async () => {
+                    // Client-side fast-fail only (BC-003) — this is UX, not the
+                    // security boundary. The real enforcement is the
+                    // `trg_enforce_pickup_assignment_rules` trigger added in
+                    // supabase/migrations/20260715120000_pickups_verified_collector_only.sql,
+                    // which must still be applied to the live database (it could
+                    // not be while the project was paused — see that migration's
+                    // header). This check just avoids a round-trip and gives a
+                    // friendlier message for the common case.
+                    if (!userProfile?.is_verified) {
+                      alert("Your collector account is still pending verification. You can't accept jobs until an admin approves your documents.");
+                      return;
+                    }
                     setIsLoading(true);
                     if (activePickup?.id) {
-                      const { error } = await supabase.from('pickups').update({
+                      // .eq('status', 'pending') closes the same race condition the
+                      // DB trigger also guards against (BC-007): if another
+                      // collector already accepted this job, the WHERE clause
+                      // matches zero rows instead of silently overwriting them.
+                      const { data, error } = await supabase.from('pickups').update({
                         collector_id: user?.id,
                         status: 'assigned'
-                      }).eq('id', activePickup.id);
-                      
-                      if (error) {
+                      }).eq('id', activePickup.id).eq('status', 'pending').select().maybeSingle();
+
+                      if (!error && !data) {
+                        alert("This pickup was just accepted by another collector.");
+                        setDismissedRequestIds(prev => activePickup?.id ? [...prev, activePickup.id] : prev);
+                        setPendingPickups(prev => prev.filter(req => req.id !== activePickup?.id));
+                        setStep(AppStep.COLLECTOR_DASHBOARD);
+                        setActivePickup(null);
+                      } else if (error) {
                         alert("Failed to accept: " + error.message);
                       } else {
                         setJobStatus('on_way');

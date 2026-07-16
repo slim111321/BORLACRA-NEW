@@ -7,7 +7,11 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "verify:syntax": "node scripts/verify/check-syntax.js",
+    "verify:no-auth-bypass": "node scripts/verify/check-no-auth-bypass.js",
+    "verify:no-secrets": "node scripts/verify/check-no-committed-secrets.js",
+    "verify:bc003-db": "echo 'Requires: supabase db start (Docker) running first. Then: docker exec -i supabase_db_SamSa psql -U postgres -d postgres -f scripts/verify/bc003-local-db-test.sql (needs a local pickups/profiles fixture first — see supabase/migrations/README.md)'"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",

@@ -1,6 +1,6 @@
 // Paystack Webhook - Secure Payment Verification
 import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
-import { createClient } from "https://esm.sh/@supabase/supabase-js@2"
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2.91.0"
 import { crypto } from "https://deno.land/std@0.168.0/crypto/mod.ts"
 
 const PAYSTACK_SECRET_KEY = Deno.env.get("PAYSTACK_SECRET_KEY") || "";

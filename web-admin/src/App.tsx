@@ -437,9 +437,18 @@ function App() {
 
   const fetchIncidents = useCallback(async () => {
     try {
+      // BC-014: the mobile app also writes customer star ratings into this
+      // table as `type: 'REVIEW'` (an RLS workaround on the `reviews` table
+      // — see supabase/SCHEMA_NOTES.md). Those rows belong in the
+      // Performance tab's review panel (fetchPerformanceData), not in this
+      // safety-incident queue. Excluding only rows explicitly marked
+      // 'REVIEW' — using .or(...) rather than a plain .neq(...) so any row
+      // with a null/unexpected `type` still shows up here rather than being
+      // silently dropped; when in doubt, an incident should stay visible.
       const { data, error } = await supabase
         .from('incident_reports')
         .select('*, profiles(id, full_name, phone_number), pickups(trash_type, pickup_location_name)')
+        .or('type.neq.REVIEW,type.is.null')
         .order('created_at', { ascending: false });
       if (error) throw error;
       setIncidentReports(data || []);
