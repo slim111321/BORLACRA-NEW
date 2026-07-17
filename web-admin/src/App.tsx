@@ -77,30 +77,73 @@ function App() {
   const [newMessage, setNewMessage] = useState('');
   const ticketChannelRef = useRef<any>(null);
 
+  // Browsers block audio.resume()/new AudioContext() unless it happens
+  // during (or shortly after) a real user gesture (click/keydown/touch) —
+  // creating a brand-new AudioContext from an async realtime callback (the
+  // old behavior here) is exactly the case Chrome/Safari silently block, so
+  // the ping never actually plays even though this function runs with no
+  // error. Keeping one persistent, gesture-unlocked context fixes that.
+  const audioContextRef = useRef<AudioContext | null>(null);
+
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (!audioContextRef.current) {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (Ctx) audioContextRef.current = new Ctx();
+      }
+      if (audioContextRef.current?.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
+      }
+    };
+    window.addEventListener('click', unlockAudio);
+    window.addEventListener('keydown', unlockAudio);
+    return () => {
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, []);
+
   const playPing = async () => {
     try {
       if (typeof navigator !== 'undefined' && navigator.vibrate) {
         navigator.vibrate([200, 100, 200]);
       }
-      const context = new (window.AudioContext || (window as any).webkitAudioContext)();
+      if (!audioContextRef.current) {
+        const Ctx = window.AudioContext || (window as any).webkitAudioContext;
+        if (!Ctx) return;
+        audioContextRef.current = new Ctx();
+      }
+      const context = audioContextRef.current;
       if (context.state === 'suspended') {
         await context.resume();
       }
-      const oscillator = context.createOscillator();
-      const gainNode = context.createGain();
+      if (context.state !== 'running') {
+        // Still locked (no user gesture has happened yet this session) —
+        // nothing more we can do until the admin interacts with the page.
+        console.warn('[Alert] AudioContext is not running yet (state=' + context.state + '); ping skipped until the next user interaction.');
+        return;
+      }
 
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(1200, context.currentTime);
-      
-      gainNode.gain.setValueAtTime(0, context.currentTime);
-      gainNode.gain.linearRampToValueAtTime(0.5, context.currentTime + 0.01);
-      gainNode.gain.exponentialRampToValueAtTime(0.01, context.currentTime + 0.5);
+      // Three quick beeps — a single 0.5s tone was easy to miss; this reads
+      // as a deliberate "big" alert rather than a soft chime.
+      [0, 0.22, 0.44].forEach((offset) => {
+        const startTime = context.currentTime + offset;
+        const oscillator = context.createOscillator();
+        const gainNode = context.createGain();
 
-      oscillator.connect(gainNode);
-      gainNode.connect(context.destination);
+        oscillator.type = 'sine';
+        oscillator.frequency.setValueAtTime(1200, startTime);
 
-      oscillator.start();
-      oscillator.stop(context.currentTime + 0.5);
+        gainNode.gain.setValueAtTime(0, startTime);
+        gainNode.gain.linearRampToValueAtTime(0.8, startTime + 0.01);
+        gainNode.gain.exponentialRampToValueAtTime(0.01, startTime + 0.2);
+
+        oscillator.connect(gainNode);
+        gainNode.connect(context.destination);
+
+        oscillator.start(startTime);
+        oscillator.stop(startTime + 0.2);
+      });
     } catch (e) {
       console.warn("Audio play failed:", e);
     }
@@ -115,13 +158,15 @@ function App() {
 
   const [systemSettings, setSystemSettings] = useState<any>({
     commission_rate: 20,
-    surge_multiplier: 1.5
+    surge_auto_active: false,
+    surge_max_multiplier: 2.5
   });
 
   // User Management State
   const [platformUsers, setPlatformUsers] = useState<any[]>([]);
   const [kycFiles, setKycFiles] = useState<any[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
+  const [ticketSearchQuery, setTicketSearchQuery] = useState('');
   const [roleFilter, setRoleFilter] = useState('ALL');
   const [selectedUserDocs, setSelectedUserDocs] = useState<any>(null);
 
@@ -221,6 +266,14 @@ function App() {
 
       if (data?.role === 'ADMIN') {
         setIsAdmin(true);
+        // BC-019: every alert below is gated on Notification.permission === 'granted',
+        // but that permission is never 'granted' until requestPermission() is actually
+        // called — it defaults to 'default' in every browser until then. Request it
+        // once, right when we've confirmed this is a real admin session (not before,
+        // so we don't prompt an unauthenticated visitor).
+        if ('Notification' in window && Notification.permission === 'default') {
+          Notification.requestPermission().catch(() => {});
+        }
       } else {
         await supabase.auth.signOut();
         setError('Access Denied: You do not have administrator privileges.');
@@ -235,7 +288,11 @@ function App() {
   const fetchAdminOverview = useCallback(async () => {
     try {
       const { count: userCount } = await supabase.from('profiles').select('*', { count: 'exact', head: true });
-      const { count: activeColl } = await supabase.from('collector_status').select('*', { count: 'exact', head: true });
+      // This used to count every row in collector_status regardless of
+      // is_online — a collector who went offline hours or days ago still
+      // counted as "active" forever, since a row is created on their first
+      // status change and never deleted.
+      const { count: activeColl } = await supabase.from('collector_status').select('*', { count: 'exact', head: true }).eq('is_online', true);
       
       const { data: revData } = await supabase.from('pickups').select('pricing_ghs').eq('status', 'completed');
       const totalRev = revData?.reduce((sum, p) => sum + (parseFloat(p.pricing_ghs) || 0), 0) ?? 0;
@@ -261,7 +318,7 @@ function App() {
   const fetchLogisticsData = useCallback(async () => {
     try {
       const { data: lf } = await supabase.from('landfills').select('*').order('name');
-      let query = supabase.from('collector_status').select('*, profiles(full_name)');
+      let query = supabase.from('collector_status').select('*, profiles(full_name, vehicle_type)');
       if (fleetFilter !== 'ALL') {
         query = query.eq('status', fleetFilter);
       }
@@ -284,6 +341,20 @@ function App() {
       if (settings) {
         const comm = settings.find(s => s.key === 'commission_rate');
         if (comm) setSystemSettings((prev: any) => ({ ...prev, commission_rate: comm.value.percentage }));
+        // This used to read/write a key called "surge_multiplier" that
+        // nothing else in the platform ever looked at — the real pricing
+        // engine (get_active_surge_multiplier, used by the Choose Vehicle
+        // screen) reads a completely different key, "surge_settings", with
+        // a different shape ({auto_active, max_multiplier}). This panel's
+        // value was never even loaded from the real setting on page load;
+        // it just sat at a hardcoded default forever, and saving it changed
+        // nothing real.
+        const surge = settings.find(s => s.key === 'surge_settings');
+        if (surge) setSystemSettings((prev: any) => ({
+          ...prev,
+          surge_auto_active: !!surge.value.auto_active,
+          surge_max_multiplier: surge.value.max_multiplier ?? 2.5,
+        }));
       }
       if (refunds) setRefundRequests(refunds);
     } catch (err) {
@@ -309,8 +380,16 @@ function App() {
 
   const fetchLiveOpsData = useCallback(async () => {
     try {
-      const { data: locs } = await supabase.from('collector_locations').select('*, profiles(full_name)');
-      const { data: picks } = await supabase.from('pickups').select('*').in('status', ['pending', 'accepted', 'collector_found', 'in_transit']);
+      // This used to fetch every collector_locations row with no is_online
+      // filter, so collectors who went offline hours ago still showed up
+      // as live map markers and counted toward "Collectors Active".
+      const { data: locs } = await supabase.from('collector_locations').select('*, profiles(full_name)').eq('is_online', true);
+      // The real pickup_status enum is pending/assigned/arrived/completed/
+      // cancelled — 'accepted', 'collector_found', and 'in_transit' are not
+      // real values and never match anything, so this only ever matched
+      // 'pending' pickups and silently missed every pickup actually in
+      // progress (assigned to a collector, or en route/arrived).
+      const { data: picks } = await supabase.from('pickups').select('*').in('status', ['pending', 'assigned', 'arrived', 'collected']);
 
       if (locs) setCollectorLocations(locs);
       if (picks) setActivePickups(picks);
@@ -403,9 +482,14 @@ function App() {
           
           return {
             id: inc.id,
-            rating: parseInt(inc.severity) || 5,
+            // The mobile app used to write this rating into a "severity"
+            // column that doesn't exist on incident_reports (it's
+            // "priority") — every one of these backup rows failed to
+            // insert, so this was always reading nothing. Fixed on both
+            // sides; reading the real column now.
+            rating: parseInt(inc.priority) || 5,
             comment: inc.description,
-            is_flagged: parseInt(inc.severity) <= 2,
+            is_flagged: parseInt(inc.priority) <= 2,
             created_at: inc.created_at,
             profiles: { full_name: 'Customer' },
             collector_profiles: collProf || { full_name: 'Collector', avatar_url: null },
@@ -490,7 +574,7 @@ function App() {
     }
   }, []);
 
-  const handleOpenChat = async (passedId: string | undefined, fallbackId?: string, incidentId?: string) => {
+  const handleOpenChat = async (passedId: string | undefined, fallbackId?: string, incidentId?: string, initialMessage?: string, subjectOverride?: string) => {
     const userId = passedId || fallbackId;
     if (!userId) {
       alert("Collector ID not found for this incident.");
@@ -519,7 +603,7 @@ function App() {
           .single();
         ticket = { ...ticket, profiles: profile || { full_name: 'Unknown User', avatar_url: null } };
       } else {
-        const subject = incidentId ? `Incident Follow-up #${incidentId.substring(0, 8)}` : 'Incident Follow-up';
+        const subject = subjectOverride || (incidentId ? `Incident Follow-up #${incidentId.substring(0, 8)}` : 'Incident Follow-up');
         const { data: inserted, error: insertError } = await supabase
           .from('support_tickets')
           .insert({ user_id: userId, subject, status: 'open' })
@@ -553,10 +637,30 @@ function App() {
 
       setActiveTicket(ticket);
       setSupportMessages([]); // Clear any old messages, will be fetched by useEffect
+
+      if (initialMessage && session?.user?.id) {
+        const { data: insertedMsg } = await supabase.from('support_messages').insert({
+          ticket_id: ticket.id,
+          sender_id: session.user.id,
+          content: initialMessage
+        }).select().single();
+        if (insertedMsg) {
+          const userAlertChan = supabase.channel(`user_alerts_${userId}`);
+          userAlertChan.subscribe((status) => {
+            if (status === 'SUBSCRIBED') {
+              userAlertChan.send({ type: 'broadcast', event: 'new_message', payload: insertedMsg })
+                .then(() => supabase.removeChannel(userAlertChan));
+            }
+          });
+        }
+      }
+
+      return ticket;
     } catch (err) {
       console.error("Open chat error details:", err);
       const msg = (err as any).message || "Unknown error";
       alert("Could not open chat: " + msg);
+      return null;
     }
   };
 
@@ -853,6 +957,31 @@ function App() {
     }
   };
 
+  const handleToggleUserStatus = async (targetUser: any) => {
+    const isCurrentlySuspended = targetUser.status === 'SUSPENDED';
+    const nextStatus = isCurrentlySuspended ? 'ACTIVE' : 'SUSPENDED';
+    const confirmed = window.confirm(
+      isCurrentlySuspended
+        ? `Reactivate ${targetUser.full_name || 'this user'}? They will regain access immediately.`
+        : `Suspend ${targetUser.full_name || 'this user'}? They will be unable to use the app until reactivated.`
+    );
+    if (!confirmed) return;
+
+    try {
+      const { error } = await supabase
+        .from('profiles')
+        .update({ status: nextStatus })
+        .eq('id', targetUser.id);
+
+      if (error) throw error;
+
+      fetchUserData();
+      alert(isCurrentlySuspended ? 'User reactivated.' : 'User suspended.');
+    } catch (err: any) {
+      alert('Failed to update user status: ' + err.message);
+    }
+  };
+
   const handleProcessPayout = async (requestId: string, approve: boolean) => {
     try {
       if (approve) {
@@ -913,6 +1042,14 @@ function App() {
     const matchesSearch = (u.full_name?.toLowerCase().includes(searchQuery.toLowerCase()) || u.phone_number?.includes(searchQuery));
     const matchesRole = roleFilter === 'ALL' || u.role === roleFilter;
     return matchesSearch && matchesRole;
+  });
+
+  // Search tickets... input had no value/onChange/filtering at all — typing
+  // in it did nothing.
+  const filteredTickets = supportTickets.filter(t => {
+    const q = ticketSearchQuery.toLowerCase();
+    if (!q) return true;
+    return t.profiles?.full_name?.toLowerCase().includes(q) || t.subject?.toLowerCase().includes(q);
   });
 
   if (loading) {
@@ -1192,7 +1329,11 @@ function App() {
                       {fleetStatus.length > 0 ? fleetStatus.map((item: any) => (
                         <tr key={item.id}>
                           <td style={{ fontWeight: 600 }}>{item.profiles?.full_name}</td>
-                          <td>{item.vehicle_type || 'Mini Truck'}</td>
+                          {/* vehicle_type lives on profiles, not collector_status — this
+                              always fell back to the hardcoded default, showing every
+                              single collector as "Mini Truck" regardless of their real
+                              registered vehicle. */}
+                          <td>{item.profiles?.vehicle_type || 'Not Registered'}</td>
                           <td>
                             <div style={{ width: '100%', height: 6, backgroundColor: 'var(--border)', borderRadius: 3 }}>
                               <div style={{ width: `${item.battery_level || 100}%`, height: '100%', backgroundColor: (item.battery_level || 100) > 20 ? '#10b981' : '#ef4444', borderRadius: 3 }}></div>
@@ -1500,7 +1641,12 @@ function App() {
                             {u.avatar_url ? <img src={u.avatar_url} style={{ width: '100%', height: '100%', objectFit: 'cover' }} /> : <UserIcon size={18} color="#94a3b8" />}
                           </div>
                           <div>
-                            <p style={{ margin: 0, fontWeight: 700, color: 'var(--text-primary)' }}>{u.full_name || 'Unnamed'}</p>
+                            <p style={{ margin: 0, fontWeight: 700, color: 'var(--text-primary)' }}>
+                              {u.full_name || 'Unnamed'}
+                              {u.status === 'SUSPENDED' && (
+                                <span style={{ marginLeft: '0.5rem', fontSize: '0.625rem', fontWeight: 800, padding: '0.1rem 0.4rem', borderRadius: '1rem', backgroundColor: '#7f1d1d', color: '#fecaca' }}>SUSPENDED</span>
+                              )}
+                            </p>
                             <p style={{ margin: 0, fontSize: '0.625rem', color: 'var(--text-muted)' }}>ID: {u.id.substring(0, 8)}...</p>
                           </div>
                         </td>
@@ -1543,8 +1689,13 @@ function App() {
                                 KYC
                               </button>
                             )}
-                            <button className="btn-sm" style={{ backgroundColor: 'var(--surface-2)', border: '1px solid var(--border)', color: 'var(--text-primary)' }}>
-                              <Settings size={14} />
+                            <button
+                              className="btn-sm"
+                              title={u.status === 'SUSPENDED' ? 'Reactivate user' : 'Suspend user'}
+                              style={{ backgroundColor: u.status === 'SUSPENDED' ? '#065f46' : 'var(--surface-2)', border: '1px solid var(--border)', color: u.status === 'SUSPENDED' ? '#d1fae5' : 'var(--text-primary)' }}
+                              onClick={() => handleToggleUserStatus(u)}
+                            >
+                              {u.status === 'SUSPENDED' ? <CheckCircle size={14} /> : <Lock size={14} />}
                             </button>
                           </div>
                         </td>
@@ -1650,7 +1801,27 @@ function App() {
                         >
                           Approve All Documents
                         </button>
-                        <button className="btn-primary" style={{ flex: 1, backgroundColor: 'var(--border)' }} onClick={() => setSelectedUserDocs(null)}>
+                        <button
+                          className="btn-primary"
+                          style={{ flex: 1, backgroundColor: 'var(--border)' }}
+                          onClick={async () => {
+                            // This used to just close the modal — no message,
+                            // no notification, nothing recorded. The collector
+                            // had no way to ever find out their documents
+                            // needed a fix. Now opens a real support ticket
+                            // with an explanatory first message, using the
+                            // same chat infrastructure as everywhere else.
+                            const user = selectedUserDocs.user;
+                            setSelectedUserDocs(null);
+                            await handleOpenChat(
+                              user.id,
+                              undefined,
+                              undefined,
+                              `Hi ${user.full_name || 'there'}, your submitted KYC documents need revision before we can verify your account. Please review your uploads (vehicle photo, ID, license, etc.) and re-submit through the app.`,
+                              'KYC Documents Need Revision'
+                            );
+                          }}
+                        >
                           Mark for Revision
                         </button>
                       </div>
@@ -1868,11 +2039,12 @@ function App() {
                 <div className="section-card" style={{ padding: '1.5rem' }}>
                   <p style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Total Revenue</p>
                   <p style={{ fontSize: '2rem', fontWeight: 900, color: 'var(--text-primary)' }}>GH₵ {intelSummary?.total_revenue?.toLocaleString() || '0'}</p>
-
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
-                    <TrendingUp size={16} color="#10b981" />
-                    <span style={{ fontSize: '0.75rem', color: '#10b981', fontWeight: 700 }}>+12.5% vs last month</span>
-                  </div>
+                  {/* A hardcoded "+12.5% vs last month" used to sit here
+                      permanently — daily_revenue_trend only covers a
+                      rolling 30-day window (see its view definition), so a
+                      real month-over-month comparison isn't available from
+                      existing data without a new query. Removed rather than
+                      show a number that was never real. */}
                 </div>
                 <div className="section-card" style={{ padding: '1.5rem' }}>
                   <p style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', marginBottom: '0.5rem' }}>Pickups Completed</p>
@@ -1975,11 +2147,17 @@ function App() {
                   <h2 className="section-title">Support Tickets</h2>
                   <div style={{ position: 'relative', marginTop: '1rem' }}>
                     <Search size={16} style={{ position: 'absolute', left: '12px', top: '10px', color: 'var(--text-muted)' }} />
-                    <input className="form-input" style={{ paddingLeft: '2.5rem', height: '36px' }} placeholder="Search tickets..." />
+                    <input
+                      className="form-input"
+                      style={{ paddingLeft: '2.5rem', height: '36px' }}
+                      placeholder="Search tickets..."
+                      value={ticketSearchQuery}
+                      onChange={(e) => setTicketSearchQuery(e.target.value)}
+                    />
                   </div>
                 </div>
                 <div style={{ flex: 1, overflowY: 'auto' }}>
-                  {supportTickets.length > 0 ? supportTickets.map(t => (
+                  {filteredTickets.length > 0 ? filteredTickets.map(t => (
                     <div 
                       key={t.id} 
                       onClick={() => setActiveTicket(t)}
@@ -1998,7 +2176,9 @@ function App() {
                       <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', margin: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{t.subject}</p>
                     </div>
                   )) : (
-                    <div style={{ padding: '3rem', textAlign: 'center', color: 'var(--text-muted)' }}>No active support tickets.</div>
+                    <div style={{ padding: '3rem', textAlign: 'center', color: 'var(--text-muted)' }}>
+                      {ticketSearchQuery ? 'No tickets match your search.' : 'No active support tickets.'}
+                    </div>
                   )}
                 </div>
               </div>
@@ -2159,23 +2339,42 @@ function App() {
                 </div>
                 <div className="section-card">
                   <div className="section-header">
-                    <h2 className="section-title">⚡ Surge Multiplier</h2>
+                    <h2 className="section-title">⚡ Surge Pricing</h2>
                   </div>
-                  <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1.5rem' }}>The pricing multiplier applied during peak demand periods.</p>
+                  <p style={{ color: 'var(--text-muted)', fontSize: '0.875rem', marginBottom: '1.5rem' }}>
+                    Controls the real surge multiplier used by the Choose Vehicle pricing engine
+                    (via <code>surge_zones</code> when active). Surge is currently{' '}
+                    <strong style={{ color: systemSettings.surge_auto_active ? '#10b981' : '#94a3b8' }}>
+                      {systemSettings.surge_auto_active ? 'ON' : 'OFF'}
+                    </strong>.
+                  </p>
+                  <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                    <input
+                      type="checkbox"
+                      id="surge-auto-active"
+                      checked={!!systemSettings.surge_auto_active}
+                      onChange={(e) => setSystemSettings((p: any) => ({ ...p, surge_auto_active: e.target.checked }))}
+                      style={{ width: 18, height: 18 }}
+                    />
+                    <label htmlFor="surge-auto-active" className="form-label" style={{ margin: 0 }}>Enable surge pricing platform-wide</label>
+                  </div>
                   <div className="form-group">
-                    <label className="form-label">Multiplier (e.g. 1.5 = 50% surge)</label>
+                    <label className="form-label">Max Multiplier Cap (e.g. 2.5 = up to 150% surge)</label>
                     <input
                       type="number" min={1} max={5} step={0.1}
                       className="form-input"
-                      value={systemSettings.surge_multiplier}
-                      onChange={(e) => setSystemSettings((p: any) => ({ ...p, surge_multiplier: e.target.value }))}
+                      value={systemSettings.surge_max_multiplier}
+                      onChange={(e) => setSystemSettings((p: any) => ({ ...p, surge_max_multiplier: e.target.value }))}
                     />
                   </div>
                   <button className="btn-primary" onClick={async () => {
-                    const { error } = await supabase.from('system_settings').upsert({ key: 'surge_multiplier', value: { multiplier: Number(systemSettings.surge_multiplier) } }, { onConflict: 'key' });
+                    const { error } = await supabase.from('system_settings').upsert({
+                      key: 'surge_settings',
+                      value: { auto_active: !!systemSettings.surge_auto_active, max_multiplier: Number(systemSettings.surge_max_multiplier) }
+                    }, { onConflict: 'key' });
                     if (error) alert('Save failed: ' + error.message);
-                    else alert('Surge multiplier saved!');
-                  }}>Save Surge Multiplier</button>
+                    else alert('Surge settings saved!');
+                  }}>Save Surge Settings</button>
                 </div>
                 <div className="section-card" style={{ gridColumn: 'span 2' }}>
                   <div className="section-header"><h2 className="section-title">ℹ️ Platform Info</h2></div>

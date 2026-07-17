@@ -95,6 +95,14 @@ export interface TrashVehicle {
   type: string;
   icon: string;
   description: string;
+  // Live dispatch/pricing fields (Choose Vehicle screen) — optional so this
+  // interface stays compatible with any code still using the static
+  // constants.ts fallback list.
+  priceValue?: number;
+  etaLabel?: string;
+  distanceLabel?: string;
+  nearbyCollectorCount?: number;
+  recommended?: boolean;
 }
 
 export interface LocationItem {

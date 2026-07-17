@@ -7,38 +7,25 @@ the project had no `supabase/migrations/` directory and no `supabase/config.toml
 
 ## Current status
 
-**The live project (`samasama`, ref `gmllzbdvmhygbedqgxgf`) is currently
-PAUSED** (confirmed via `supabase link --project-ref gmllzbdvmhygbedqgxgf` →
-`project is paused`). This means:
+The live project (`samasama`, ref `gmllzbdvmhygbedqgxgf`) was paused earlier
+in this project's history but is reachable again. All migrations in this
+directory have been applied to it via `supabase db push` (confirmed via
+`supabase migration list` showing every timestamp present under Remote, and
+via live queries against the real tables/functions afterward — see each
+migration's entry below).
 
-- No live schema/RLS-policy introspection could be performed as part of this
-  fix (BC-015). `supabase db pull` / `supabase db dump` both require an active
-  database connection.
-- Nothing in this repository can currently be validated against the real,
-  current state of the database.
-- **The application cannot function in production while the project is
-  paused**, independent of any code fix — this is itself a production
-  blocker an admin needs to resolve from the Supabase dashboard
-  (https://supabase.com/dashboard/project/gmllzbdvmhygbedqgxgf).
+See `../SCHEMA_NOTES.md` for schema/RLS notes gathered from a real
+`supabase db dump` against the live project.
 
-See `../SCHEMA_NOTES.md` for a best-effort schema/RLS picture reconstructed
-from application source code (not a live export) — use it as a starting
-point for review, not as a source of truth.
+## Applying new migrations going forward
 
-## Once the project is unpaused
-
-1. Run `supabase link --project-ref gmllzbdvmhygbedqgxgf` to complete linking.
-2. Run `supabase db pull` to generate a real baseline migration from the
-   live schema. This becomes the true source of truth this directory has
-   been missing.
-3. Reconcile that baseline against `../SCHEMA_NOTES.md` — anywhere they
-   disagree, the live pull wins, and `SCHEMA_NOTES.md` should be corrected
-   or removed.
-4. From that point forward, every schema/RLS change should be a new file in
-   this directory (`supabase migration new <name>`), applied with
-   `supabase db push` only after review — never edited directly in the
-   dashboard without also capturing the change here, or this directory will
-   drift out of sync again.
+1. `supabase migration new <name>` to create a new timestamped file here.
+2. Write the forward migration and a paired rollback in `../rollback/`.
+3. Validate locally first (`supabase start` + a temporary fixture migration
+   mirroring the real columns/policies involved — see the two migrations
+   below for the established pattern), then `supabase db push` to apply to
+   the live project — never edit the dashboard directly without also
+   capturing the change here, or this directory drifts out of sync again.
 
 ## Migrations in this directory so far
 
@@ -57,12 +44,7 @@ point for review, not as a source of truth.
   non-collector role rejected ✅, second-collector race on an
   already-assigned job rejected with the original assignment preserved ✅,
   unrelated updates (e.g. marking a job collected) pass through untouched ✅.
-  This still has **not been applied to the live `samasama` project**, since
-  it is paused — only local-fixture-tested. Re-run
-  `scripts/verify/bc003-local-db-test.sql` after `supabase db push` against
-  a staging/branch environment (with real `pickups`/`profiles` data) before
-  trusting it in production, since the real tables may have constraints or
-  triggers this local fixture didn't include.
+  **Applied to the live `samasama` project** via `supabase db push`.
 
   **Rollback**: `supabase/rollback/20260715120000_pickups_verified_collector_only_DOWN.sql`
   (kept outside this directory so it's never auto-applied as a forward
@@ -72,6 +54,52 @@ point for review, not as a source of truth.
   were gone (`pg_trigger`/`pg_proc` empty), and confirmed the same
   previously-blocked write now succeeded — proving the rollback is
   complete, not partial.
+
+- `20260716060000_vehicle_dispatch_pricing.sql` — Choose Vehicle screen: adds
+  `price_per_km` / `price_per_bag` / `active` to the real, already-live
+  `trash_vehicles` table (seeded with placeholder starter rates — adjust as
+  a real business decision), plus two new SECURITY DEFINER RPCs:
+  `find_available_collectors_by_vehicle` (vehicle-type-aware nearest-collector
+  search, modeled on the existing `find_nearby_collectors`) and
+  `get_active_surge_multiplier` (reads `system_settings.surge_settings` +
+  `surge_zones`, returns 1.0/no-op today since `auto_active` is currently
+  `false`). Written and tested against a local Postgres fixture that
+  replicates the real live `collector_locations`/`profiles`/`system_settings`/
+  `surge_zones` columns confirmed via a real `supabase db dump`.
+  **Applied to the live `samasama` project** via `supabase db push` and
+  verified with real post-push queries: `trash_vehicles` returns the new
+  columns with real data, `get_active_surge_multiplier` returns `1` (no
+  surge, matching the real `system_settings.surge_settings.auto_active =
+  false`).
+
+  **Rollback**: `supabase/rollback/20260716060000_vehicle_dispatch_pricing_DOWN.sql`
+  — drops both new functions and the three new columns; does not touch any
+  pre-existing `trash_vehicles` row or column.
+
+- `20260716120000_profile_preferred_payment_method.sql` — Payment Methods
+  screen: adds a nullable `preferred_payment_method` column to `profiles` so
+  the screen (previously fully decorative — no row had an `onPress`) can
+  persist which method a customer selected as default. Deliberately narrow:
+  no real MoMo/card processing is wired to this column, since payments stay
+  out of scope for now. Tested locally as a real non-admin customer via
+  RLS-enforced REST calls before pushing. **Applied to the live `samasama`
+  project** via `supabase db push` and confirmed live-readable afterward.
+
+- `20260717090000_loyalty_redemptions.sql` — Fuel Hub "Activate Voucher"
+  (GOIL): adds a real redemption ledger (`collector_id`, `reward_type`,
+  `points_spent`, `voucher_code`, `status`). Previously this button only
+  showed a static Alert — no points were spent and nothing was recorded.
+  RLS scoped to `collector_id = auth.uid()` for both select and insert.
+  Tested locally as two separate real collectors via RLS-enforced REST
+  calls (points deduction + redemption insert + confirmed per-collector
+  isolation) before pushing. **Applied to the live `samasama` project** via
+  `supabase db push` and confirmed live-readable afterward.
+
+  **Rollback**: `supabase/rollback/20260717090000_loyalty_redemptions_DOWN.sql`
+  — drops the table entirely.
+
+  **Rollback**: `supabase/rollback/20260716120000_profile_preferred_payment_method_DOWN.sql`
+  — drops the column; touches nothing else.
 
 ## Migration standards (established here, as the first migration in this project)
 

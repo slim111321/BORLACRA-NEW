@@ -19,7 +19,9 @@ import {
   Linking,
   Modal,
   Vibration,
-  PanResponder
+  PanResponder,
+  Keyboard,
+  TouchableWithoutFeedback
 } from 'react-native';
 import {
   Bell, User, MapPin, ChevronLeft, ChevronRight, Clock,
@@ -39,7 +41,9 @@ import { BottomNav } from './components/BottomNav';
 import { MapComponent, CollectorPin } from './components/MapComponent';
 import { CameraComponent } from './components/CameraComponent';
 import { SubscriptionsScreen } from './components/SubscriptionsScreen';
-import { analyzeTrashImage, TrashEstimate } from './utils/gemini';
+import { analyzeTrashImage, TrashEstimate } from './utils/aiEstimator';
+import { getVehicleOptions, inferRecommendedVehicleName } from './utils/vehicleDispatch';
+import { getRouteDistanceAndDuration, formatEtaMinutes, formatDistanceKm } from './utils/routing';
 import {
   getUserLocation,
   updateCollectorLocation,
@@ -57,7 +61,7 @@ import {
   calculateDistance,
 } from './utils/location';
 import { ActivityType, logPlatformActivity } from './utils/activity';
-import { registerForPushNotificationsAsync, schedulePredictiveReminder, sendPushNotification } from './utils/notifications';
+import { registerForPushNotificationsAsync, schedulePredictiveReminder, sendPushNotification, savePushTokenAsync } from './utils/notifications';
 
 import { PaymentComponent } from './components/PaymentComponent';
 import { PaystackProvider } from 'react-native-paystack-webview';
@@ -122,11 +126,39 @@ export default function App() {
   const [language, setLanguage] = useState<'English' | 'Twi'>('English');
   const [pickups, setPickups] = useState<any[]>([]);
   const [selectedVehicle, setSelectedVehicle] = useState<TrashVehicle | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
+  const [vehicleOptions, setVehicleOptions] = useState<TrashVehicle[]>([]);
+  const [isLoadingVehicleOptions, setIsLoadingVehicleOptions] = useState(false);
+  const [selectedSpeed, setSelectedSpeed] = useState<'priority' | 'wait_save'>('priority');
+  // A single global `isLoading` flag used to be shared by ~22 unrelated
+  // actions across the whole app, driving one root-level full-screen
+  // overlay (`styles.globalLoading`) — so opening Profile, booking a
+  // pickup, or any background fetch all froze the entire UI, not just the
+  // thing that was actually loading. Replaced with one dedicated flag per
+  // action/screen below; each button shows its own local loading state via
+  // the Button component's `isLoading` prop (or inline text) instead.
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [isPostingScrap, setIsPostingScrap] = useState(false);
+  const [isConvoyActionLoading, setIsConvoyActionLoading] = useState(false);
+  const [isWithdrawing, setIsWithdrawing] = useState(false);
+  const [isAuthenticating, setIsAuthenticating] = useState(false);
+  const [isArriving, setIsArriving] = useState(false);
+  const [isCollecting, setIsCollecting] = useState(false);
+  const [isFinalizingJob, setIsFinalizingJob] = useState(false);
+  const [isReportingIncident, setIsReportingIncident] = useState(false);
+  const [isRequestingCollection, setIsRequestingCollection] = useState(false);
+  const [isSendingOtp, setIsSendingOtp] = useState(false);
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  const [isGeocoding, setIsGeocoding] = useState(false);
+  const [isAcceptingJob, setIsAcceptingJob] = useState(false);
+  const [isSavingVehicleDetails, setIsSavingVehicleDetails] = useState(false);
+  const [isSubmittingDocuments, setIsSubmittingDocuments] = useState(false);
+  const [isSubmittingProof, setIsSubmittingProof] = useState(false);
+  const [isBookingFromEstimate, setIsBookingFromEstimate] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [paymentSuccess, setPaymentSuccess] = useState(false);
   const [showRatingModal, setShowRatingModal] = useState(false);
   const [ratingCollector, setRatingCollector] = useState<any>(null);
+  const [ratingPickupId, setRatingPickupId] = useState<string | null>(null);
   const [selectedRating, setSelectedRating] = useState(5);
   const [ratingComment, setRatingComment] = useState('');
   const [selectedRatingTag, setSelectedRatingTag] = useState('');
@@ -147,6 +179,12 @@ export default function App() {
   const [editPhone, setEditPhone] = useState('');
   const [editAddress, setEditAddress] = useState('');
   const [isUploading, setIsUploading] = useState(false);
+  const [savedLocationsList, setSavedLocationsList] = useState<any[]>([]);
+  const [isLoadingSavedLocations, setIsLoadingSavedLocations] = useState(false);
+  const [showAddSavedLocation, setShowAddSavedLocation] = useState(false);
+  const [newSavedLocationName, setNewSavedLocationName] = useState('');
+  const [newSavedLocationAddress, setNewSavedLocationAddress] = useState('');
+  const [isSavingLocation, setIsSavingLocation] = useState(false);
 
   // --- Bottom Sheet Animation State ---
   const SCREEN_HEIGHT = Dimensions.get('window').height;
@@ -221,6 +259,8 @@ export default function App() {
   const [activePickup, setActivePickup] = useState<any>(null);
   const [jobStatus, setJobStatus] = useState<'idle' | 'request' | 'on_way' | 'arrived' | 'collected' | 'completed'>('idle');
   const [collectorCoords, setCollectorCoords] = useState<UserCoords | null>(null);
+  const [collectorEtaLabel, setCollectorEtaLabel] = useState<string | null>(null);
+  const lastEtaFetchRef = useRef<number>(0);
   const [dismissedRequestIds, setDismissedRequestIds] = useState<string[]>([]);
   const dismissedIdsRef = useRef<string[]>([]);
 
@@ -306,13 +346,14 @@ export default function App() {
     }
     setIsSearchingLocation(true);
     try {
-      // Bias results toward Ghana for better local relevance
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query + ', Ghana')}&format=json&addressdetails=1&limit=8&countrycodes=gh`;
+      // Bias results toward Ghana for better local relevance; dedupe=1 avoids
+      // near-identical duplicate rows for the same place.
+      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query + ', Ghana')}&format=json&addressdetails=1&limit=8&countrycodes=gh&dedupe=1`;
       const res = await fetch(url, {
         headers: { 'Accept-Language': 'en', 'User-Agent': 'BorlaApp/1.0' }
       });
       const data = await res.json();
-      setLocationSearchResults(data);
+      setLocationSearchResults(Array.isArray(data) ? data : []);
     } catch (e) {
       console.error('Nominatim search error:', e);
       setLocationSearchResults([]);
@@ -334,6 +375,17 @@ export default function App() {
     setPickupAddress(address);
     setLocationSearchQuery(name);
     setLocationSearchResults([]);
+    // This never actually moved the map pin or updated the coordinates used
+    // for booking — Nominatim's response already includes lat/lon per
+    // result, it just wasn't being read. Selecting a suggestion updated the
+    // text field only, so the app kept using whatever GPS/previous
+    // coordinates it already had, silently ignoring what was searched for.
+    const lat = parseFloat(result.lat);
+    const lon = parseFloat(result.lon);
+    if (!isNaN(lat) && !isNaN(lon)) {
+      setUserCoords({ latitude: lat, longitude: lon });
+      setLocationLabel(name);
+    }
   };
   // ── END NOMINATIM ────────────────────────────────────────────────────────
 
@@ -404,6 +456,9 @@ export default function App() {
   });
   const [approvalStatus, setApprovalStatus] = useState('pending'); // pending, approved, rejected
   const [navigationProgress, setNavigationProgress] = useState(0);
+  const [collectorNavDistanceLabel, setCollectorNavDistanceLabel] = useState<string | null>(null);
+  const [collectorNavEtaLabel, setCollectorNavEtaLabel] = useState<string | null>(null);
+  const lastNavEtaFetchRef = useRef<number>(0);
   const [proofImage, setProofImage] = useState<string | null>(null);
   const [isCardExpanded, setIsCardExpanded] = useState(false);
 
@@ -460,6 +515,10 @@ export default function App() {
 
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<'paystack' | 'cash'>('paystack');
   const [pendingPickups, setPendingPickups] = useState<any[]>([]);
+  const [selectedScheduleDate, setSelectedScheduleDate] = useState<Date>(new Date());
+  const [recurringRoutes, setRecurringRoutes] = useState<any[]>([]);
+  const [isLoadingRecurringRoutes, setIsLoadingRecurringRoutes] = useState(false);
+  const [isRedeemingVoucher, setIsRedeemingVoucher] = useState(false);
   const [newRequestOverlay, setNewRequestOverlay] = useState<any>(null);
   const [splitAmount, setSplitAmount] = useState(85.0);
   const [showWithdrawModal, setShowWithdrawModal] = useState(false);
@@ -494,6 +553,7 @@ export default function App() {
   const collectorLocationIntervalRef = React.useRef<NodeJS.Timeout | null>(null);
   const prevPendingCount = useRef(0);
   const [collectorMetric, setCollectorMetric] = useState<any>(null);
+  const [collectorReviews, setCollectorReviews] = useState<any[]>([]);
   const [landfills, setLandfills] = useState<any[]>([]);
 
   useEffect(() => {
@@ -502,8 +562,15 @@ export default function App() {
 
 
   useEffect(() => {
-    setSplitAmount(Number((85.00 / splitWays).toFixed(2)));
-  }, [splitWays]);
+    // This used to divide a hardcoded GH₵85 regardless of what the
+    // customer actually booked, so the Payment screen (and the amount
+    // actually sent to Paystack) never matched the real, dynamically
+    // computed price shown on the Choose Vehicle screen. 85 is now only a
+    // placeholder fallback for the brief moment before a real pickup with a
+    // real pricing_ghs exists.
+    const totalPrice = Number(activePickup?.pricing_ghs) || 85.00;
+    setSplitAmount(Number((totalPrice / splitWays).toFixed(2)));
+  }, [splitWays, activePickup?.pricing_ghs]);
 
 
   // Job Request Timer Logic
@@ -639,13 +706,20 @@ export default function App() {
   };
 
   const fetchHistory = useCallback(async (silent = false) => {
+    // This used to set the GLOBAL isLoading flag (freezing the entire app,
+    // not just the pickups list) whenever called non-silently — and it was
+    // being called non-silently on every HOME/HISTORY/COLLECTOR_DASHBOARD
+    // screen entry, plus once per realtime pickups change platform-wide
+    // (see the public:pickups subscription below, now fixed to pass
+    // silent=true). A background list refresh should never block the UI;
+    // isHistoryLoading only drives a small in-screen indicator.
     if (!silent) {
-      setIsLoading(true);
+      setIsHistoryLoading(true);
     }
     try {
       const { data: { user: authUser } } = await supabase.auth.getUser();
       if (!authUser) {
-        if (!silent) setIsLoading(false);
+        if (!silent) setIsHistoryLoading(false);
         return;
       }
 
@@ -712,7 +786,7 @@ export default function App() {
     } catch (err) {
       console.error('[History] Unexpected error:', err);
     } finally {
-      if (!silent) setIsLoading(false);
+      if (!silent) setIsHistoryLoading(false);
     }
   }, [role, userProfile, activePickup]);
 
@@ -807,7 +881,27 @@ export default function App() {
             if (activePickup && updated.id === activePickup.id) {
               setActivePickup(prev => ({ ...prev, ...updated }));
               if (updated.status === 'collected') setJobStatus('collected');
-              if (updated.status === 'completed') setJobStatus('completed');
+              if (updated.status === 'completed') {
+                setJobStatus('completed');
+                // The only other place that opens the rating modal is
+                // handlePaymentSuccess, which requires a real Paystack
+                // payment to complete first. A pickup normally reaches
+                // 'collected' (which routes the customer to the Payment
+                // screen) before it ever reaches 'completed', so by this
+                // point the customer is already on that screen — payments
+                // are currently disabled/skipped for testing, so
+                // handlePaymentSuccess never fires and customers could
+                // never rate a collector at all. Trigger it here too, the
+                // moment the job is genuinely done, independent of payment.
+                // Guarded on !isPaying (not on the Payment screen itself) so
+                // this can never pop up on top of a real in-progress
+                // Paystack transaction.
+                if (role === UserRole.CUSTOMER && !isPaying && updated.collector_id) {
+                  setRatingCollector(activePickup.collector || { id: updated.collector_id });
+                  setRatingPickupId(updated.id);
+                  setShowRatingModal(true);
+                }
+              }
             }
           }
 
@@ -869,7 +963,7 @@ export default function App() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [user?.id, role, activePickup?.id]);
+  }, [user?.id, role, activePickup?.id, isPaying]);
 
   // Ensure collector hears the ping whenever a new request overlay is shown
   useEffect(() => {
@@ -992,6 +1086,56 @@ export default function App() {
     };
   }, [role, activePickup?.collector_id]);
 
+  // Real ETA for the "collector is on the way" marker badge — this used to
+  // be a hardcoded "5:12" that never changed no matter how far away the
+  // collector actually was. Recalculated via the same OSRM routing used for
+  // Choose Vehicle pricing, throttled to roughly once per 15s (collectorCoords
+  // can update every ~2s during active navigation — recalculating on every
+  // single GPS tick would hammer the public OSRM endpoint for no visible
+  // benefit, since ETA doesn't need sub-15s precision).
+  useEffect(() => {
+    if (role !== UserRole.CUSTOMER || !collectorCoords || !userCoords) {
+      setCollectorEtaLabel(null);
+      return;
+    }
+    const now = Date.now();
+    if (now - lastEtaFetchRef.current < 15000) return;
+    lastEtaFetchRef.current = now;
+
+    let cancelled = false;
+    getRouteDistanceAndDuration(collectorCoords.latitude, collectorCoords.longitude, userCoords.latitude, userCoords.longitude)
+      .then((route) => {
+        if (!cancelled && route) setCollectorEtaLabel(formatEtaMinutes(route.durationMinutes));
+      });
+    return () => { cancelled = true; };
+  }, [role, collectorCoords, userCoords]);
+
+  // Real distance/ETA for the collector's own "Navigate to Pickup" card —
+  // this used to be (2.3 * (1 - navigationProgress)).toFixed(1) km, and
+  // navigationProgress was never set anywhere after its initial value of 0,
+  // so it permanently displayed the fixed fake value "2.3 km • ~8 mins" no
+  // matter where the collector actually was. Same 15s throttle as the
+  // customer-facing ETA above, for the same reason.
+  useEffect(() => {
+    const pickupLat = Number(activePickup?.lat);
+    const pickupLng = Number(activePickup?.lng);
+    if (role !== UserRole.COLLECTOR || jobStatus !== 'on_way' || !userCoords || !pickupLat || !pickupLng) {
+      return;
+    }
+    const now = Date.now();
+    if (now - lastNavEtaFetchRef.current < 15000) return;
+    lastNavEtaFetchRef.current = now;
+
+    let cancelled = false;
+    getRouteDistanceAndDuration(userCoords.latitude, userCoords.longitude, pickupLat, pickupLng)
+      .then((route) => {
+        if (cancelled || !route) return;
+        setCollectorNavDistanceLabel(formatDistanceKm(route.distanceKm));
+        setCollectorNavEtaLabel(formatEtaMinutes(route.durationMinutes));
+      });
+    return () => { cancelled = true; };
+  }, [role, jobStatus, userCoords, activePickup?.lat, activePickup?.lng]);
+
   // Auto-Arrival Detection for Collectors
   useEffect(() => {
     if (role !== UserRole.COLLECTOR || jobStatus !== 'on_way' || !activePickup || !userCoords) return;
@@ -1076,6 +1220,31 @@ export default function App() {
 
     ensureActiveTicket();
   }, [step, user?.id, role, activeTicket?.id]);
+
+  // Live collector-approval listener — approvalStatus was never set to
+  // 'approved' anywhere in the app, so a collector sitting on the "Under
+  // Review" screen waiting had no way to find out they'd actually been
+  // approved (in web-admin, which sets profiles.is_verified = true)
+  // without manually restarting the app.
+  useEffect(() => {
+    if (step !== AppStep.COLLECTOR_PENDING_APPROVAL || !user?.id) return;
+
+    const channel = supabase
+      .channel(`approval_${user.id}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'profiles', filter: `id=eq.${user.id}` },
+        (payload) => {
+          if (payload.new.is_verified) {
+            setUserProfile((prev: any) => ({ ...prev, is_verified: true }));
+            setApprovalStatus('approved');
+          }
+        }
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+  }, [step, user?.id]);
 
   // Dedicated Support Chat Listener (Broadcast-based)
   useEffect(() => {
@@ -1327,6 +1496,24 @@ export default function App() {
     }
   }, [user?.id]);
 
+  const fetchCollectorReviews = useCallback(async () => {
+    if (!user?.id) return;
+    try {
+      const { data, error } = await supabase
+        .from('reviews')
+        .select('rating, comment, created_at')
+        .eq('reviewee_id', user.id)
+        .eq('status', 'ACTIVE')
+        .order('created_at', { ascending: false })
+        .limit(10);
+      if (!error && data) {
+        setCollectorReviews(data);
+      }
+    } catch (e) {
+      console.error('fetchCollectorReviews failed:', e);
+    }
+  }, [user?.id]);
+
 
   const fetchLandfills = useCallback(async () => {
     try {
@@ -1338,6 +1525,66 @@ export default function App() {
       console.error('fetchLandfills failed:', e);
     }
   }, []);
+
+  // "My Recurring Routes" used to be a single hardcoded card ("Kasoa Sector
+  // 4", fake earnings) that never changed. subscriptions is the real table
+  // customers create recurring pickup schedules in (day_of_week,
+  // time_window, collection_address) — not yet assigned to individual
+  // collectors, so this surfaces all active ones as discoverable recurring
+  // work, matching the existing "+ Find Routes" label.
+  const fetchRecurringRoutes = useCallback(async () => {
+    setIsLoadingRecurringRoutes(true);
+    try {
+      const { data, error } = await supabase
+        .from('subscriptions')
+        .select('*')
+        .eq('status', 'active')
+        .order('created_at', { ascending: false });
+      if (!error && data) setRecurringRoutes(data);
+    } catch (e) {
+      console.error('fetchRecurringRoutes failed:', e);
+    } finally {
+      setIsLoadingRecurringRoutes(false);
+    }
+  }, []);
+
+  // Fuel Hub "Activate Voucher" used to just show a static Alert and do
+  // nothing real — no points were spent, nothing was recorded. This spends
+  // real loyalty_points and issues a real, persisted voucher code.
+  const GOIL_VOUCHER_POINTS_COST = 200;
+  const handleActivateFuelVoucher = async () => {
+    if (!user?.id) return;
+    if (loyaltyPoints < GOIL_VOUCHER_POINTS_COST) {
+      Alert.alert('Not Enough Points', `You need at least ${GOIL_VOUCHER_POINTS_COST} points to activate a GOIL voucher. You have ${loyaltyPoints}.`);
+      return;
+    }
+    setIsRedeemingVoucher(true);
+    try {
+      const newBalance = loyaltyPoints - GOIL_VOUCHER_POINTS_COST;
+      const voucherCode = 'GOIL-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+
+      const { error: pointsError } = await supabase
+        .from('profiles')
+        .update({ loyalty_points: newBalance })
+        .eq('id', user.id);
+      if (pointsError) throw pointsError;
+
+      const { error: redemptionError } = await supabase.from('loyalty_redemptions').insert({
+        collector_id: user.id,
+        reward_type: 'GOIL_FUEL_VOUCHER',
+        points_spent: GOIL_VOUCHER_POINTS_COST,
+        voucher_code: voucherCode,
+      });
+      if (redemptionError) throw redemptionError;
+
+      setLoyaltyPoints(newBalance);
+      Alert.alert('Voucher Activated 🎉', `Show this code to the GOIL attendant:\n\n${voucherCode}\n\n${GOIL_VOUCHER_POINTS_COST} points were deducted from your balance.`);
+    } catch (e: any) {
+      Alert.alert('Error', 'Could not activate voucher: ' + e.message);
+    } finally {
+      setIsRedeemingVoucher(false);
+    }
+  };
   const fetchCollectorWallet = useCallback(async () => {
     if (!user?.id) return;
     try {
@@ -1348,6 +1595,18 @@ export default function App() {
         .single();
       if (!error && data) {
         setWalletBalance(data.wallet_balance || 0);
+      }
+
+      const { data: txData, error: txError } = await supabase
+        .from('wallet_transactions')
+        .select('type, amount, reference, created_at')
+        .eq('collector_id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(30);
+      if (!txError && txData) {
+        setWalletTransactions(txData);
+      } else if (txError) {
+        console.error('fetchCollectorWallet: wallet_transactions fetch failed:', txError);
       }
     } catch (e) {
       console.error('fetchCollectorWallet failed:', e);
@@ -1442,7 +1701,7 @@ export default function App() {
       Alert.alert('Missing Info', 'Please enter at least the quantity.');
       return;
     }
-    setIsLoading(true);
+    setIsPostingScrap(true);
     const { error } = await supabase.from('scrap_listings').insert({
       collector_id: user.id,
       material_type: newScrapListing.material_type,
@@ -1460,7 +1719,7 @@ export default function App() {
       setNewScrapListing({ material_type: 'PLASTIC', quantity_kg: '', asking_price: '' });
       fetchScrapData();
     }
-    setIsLoading(false);
+    setIsPostingScrap(false);
   };
 
 
@@ -1522,19 +1781,9 @@ export default function App() {
 
   const fetchChallenges = useCallback(async () => {
     if (!user?.id) return;
-    const { data } = await supabase
-      .from('challenges')
-      .select(`
-        *,
-        collector_challenges!left(*)
-      `)
-      .eq('collector_challenges.collector_id', user.id);
-    
-    // If no specific progress record exists yet, the collector_challenges array will be empty
-    // But we still want to show the challenge as 0 progress.
-    // If the filter above excludes challenges with NO progress yet, we need a different approach.
-    // Let's use a simpler approach: fetch all and filter or use a more precise query.
-    
+    // Fetch every challenge plus everyone's progress records, then keep only
+    // this collector's own progress per challenge (so a challenge with no
+    // progress row yet still shows up at 0, not filtered out).
     const { data: allCh } = await supabase.from('challenges').select('*, collector_challenges(*)');
     if (allCh) {
       const filtered = allCh.map(ch => ({
@@ -1545,9 +1794,22 @@ export default function App() {
     }
   }, [user?.id]);
 
+  // "Top Collectors" leaderboard on the Challenges screen — topPerformers
+  // was declared but never populated anywhere, so it permanently showed
+  // "Leaderboard loading..." no matter what.
+  const fetchTopPerformers = useCallback(async () => {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id, full_name, loyalty_points')
+      .eq('role', 'COLLECTOR')
+      .order('loyalty_points', { ascending: false })
+      .limit(10);
+    if (!error && data) setTopPerformers(data);
+  }, []);
+
   const handleStartConvoy = async () => {
     if (!user?.id) return;
-    setIsLoading(true);
+    setIsConvoyActionLoading(true);
     try {
       const { data, error } = await supabase
         .from('convoys')
@@ -1573,13 +1835,13 @@ export default function App() {
     } catch (err: any) {
       Alert.alert('Error', err.message || 'Could not start convoy');
     } finally {
-      setIsLoading(false);
+      setIsConvoyActionLoading(false);
     }
   };
 
   const handleJoinConvoy = async (convoyId: string, zoneName: string) => {
     if (!user?.id) return;
-    setIsLoading(true);
+    setIsConvoyActionLoading(true);
     try {
       const { error } = await supabase
         .from('convoy_members')
@@ -1596,16 +1858,16 @@ export default function App() {
     } catch (err: any) {
       Alert.alert('Error', err.message || 'Could not join convoy');
     } finally {
-      setIsLoading(false);
+      setIsConvoyActionLoading(false);
     }
   };
 
-  const handleLeaveConvoy = async () => {
+  const handleLeaveConvoy = async (navigateAway: boolean = true) => {
     if (!user?.id) {
-      setStep(AppStep.COLLECTOR_DASHBOARD);
+      if (navigateAway) setStep(AppStep.COLLECTOR_DASHBOARD);
       return;
     }
-    setIsLoading(true);
+    setIsConvoyActionLoading(true);
     try {
       if (currentConvoyId) {
         await supabase
@@ -1618,11 +1880,16 @@ export default function App() {
       setCurrentConvoyId(null);
       setConvoyActive(false);
       fetchConvoys();
-      setStep(AppStep.COLLECTOR_DASHBOARD);
+      // The dedicated Convoy Mode screen's button always doubles as a
+      // back button ("Leave Convoy" / "Back"), so it should navigate away.
+      // The Safety Center toggle is a simple on/off switch on a screen with
+      // other controls (SOS, emergency contacts) — flipping it shouldn't
+      // also kick the collector off the screen.
+      if (navigateAway) setStep(AppStep.COLLECTOR_DASHBOARD);
     } catch (err) {
       console.error(err);
     } finally {
-      setIsLoading(false);
+      setIsConvoyActionLoading(false);
     }
   };
 
@@ -1631,7 +1898,7 @@ export default function App() {
       Alert.alert('Action Required', 'You must start or join a convoy before inviting others.');
       return;
     }
-    setIsLoading(true);
+    setIsConvoyActionLoading(true);
     try {
       const coords = await getUserLocation();
       if (!coords) return;
@@ -1660,7 +1927,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
     } finally {
-      setIsLoading(false);
+      setIsConvoyActionLoading(false);
     }
   };
 
@@ -1708,6 +1975,67 @@ export default function App() {
     Alert.alert('Location Updated', `Now showing collectors near ${loc.name || loc.address}`);
   };
 
+  // Saved Locations screen used to render the same hardcoded
+  // constants.ts list to every user, and "+ Add New Location" just
+  // navigated to itself. saved_locations is a real, already-existing,
+  // per-user table (RLS-scoped to auth.uid() = user_id) that was never
+  // wired up.
+  const fetchSavedLocations = useCallback(async () => {
+    if (!user?.id) return;
+    setIsLoadingSavedLocations(true);
+    const { data, error } = await supabase
+      .from('saved_locations')
+      .select('*')
+      .eq('user_id', user.id)
+      .order('created_at', { ascending: false });
+    if (!error && data) setSavedLocationsList(data);
+    setIsLoadingSavedLocations(false);
+  }, [user?.id]);
+
+  const handleAddSavedLocation = async () => {
+    if (!newSavedLocationName.trim() || newSavedLocationAddress.trim().length < 5) {
+      Alert.alert('Missing Info', 'Please enter a nickname and a specific address.');
+      return;
+    }
+    setIsSavingLocation(true);
+    try {
+      const results = await ExpoLocation.geocodeAsync(newSavedLocationAddress.trim());
+      if (results.length === 0) {
+        Alert.alert('Location Not Found', 'Could not find that address. Please check it and try again.');
+        return;
+      }
+      const { latitude, longitude } = results[0];
+      const { error } = await supabase.from('saved_locations').insert({
+        user_id: user?.id,
+        name: newSavedLocationName.trim(),
+        address: newSavedLocationAddress.trim(),
+        latitude,
+        longitude,
+      });
+      if (error) {
+        Alert.alert('Error', 'Could not save this location: ' + error.message);
+        return;
+      }
+      setNewSavedLocationName('');
+      setNewSavedLocationAddress('');
+      setShowAddSavedLocation(false);
+      fetchSavedLocations();
+    } catch (e: any) {
+      Alert.alert('Error', 'Could not save this location: ' + e.message);
+    } finally {
+      setIsSavingLocation(false);
+    }
+  };
+
+  const handleDeleteSavedLocation = async (locationId: string) => {
+    const { error } = await supabase.from('saved_locations').delete().eq('id', locationId);
+    if (error) {
+      Alert.alert('Error', 'Could not delete this location: ' + error.message);
+      return;
+    }
+    setSavedLocationsList((prev) => prev.filter((l) => l.id !== locationId));
+  };
+
   const calculateImpact = () => {
     const completed = pickups.filter(p => p.status === 'COMPLETED' || p.status === 'completed');
     const totalKg = completed.reduce((acc, p) => acc + (p.weight_kg || 15), 0);
@@ -1731,7 +2059,7 @@ export default function App() {
       return;
     }
 
-    setIsLoading(true);
+    setIsWithdrawing(true);
     const { error } = await supabase.from('payout_requests').insert({
       collector_id: user.id,
       amount: amount,
@@ -1749,7 +2077,7 @@ export default function App() {
       setWithdrawAmount('');
       fetchCollectorWallet();
     }
-    setIsLoading(false);
+    setIsWithdrawing(false);
   };
 
   const handleEmailAuth = async () => {
@@ -1761,14 +2089,14 @@ export default function App() {
       alert("Password must be at least 6 characters long.");
       return;
     }
-    setIsLoading(true);
+    setIsAuthenticating(true);
     // Security check: Never allow new signups to claim the ADMIN role
     const assignedRole = (role === UserRole.ADMIN) ? UserRole.CUSTOMER : (role || UserRole.CUSTOMER);
     if (isSignupMode) {
       const { data, error } = await supabase.auth.signUp({ email, password });
       if (error) {
         alert(error.message);
-        setIsLoading(false);
+        setIsAuthenticating(false);
         return;
       }
       if (data.user) {
@@ -1776,7 +2104,7 @@ export default function App() {
         if (!data.session) {
           alert("Registration successful! Please check your email to confirm your account, then log in.");
           setIsSignupMode(false);
-          setIsLoading(false);
+          setIsAuthenticating(false);
           return;
         }
 
@@ -1797,7 +2125,7 @@ export default function App() {
       const { data, error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) {
         alert(error.message + "\n\nIf you don't have an account, switch to Signup mode.");
-        setIsLoading(false);
+        setIsAuthenticating(false);
         return;
       }
       if (data.session?.user) {
@@ -1831,7 +2159,7 @@ export default function App() {
         }
       }
     }
-    setIsLoading(false);
+    setIsAuthenticating(false);
   };
 
   // ── Collector Job Handlers ────────────────────────────────────────────────
@@ -1858,7 +2186,7 @@ export default function App() {
 
   const handleArrival = async () => {
     if (!activePickup?.id) return;
-    setIsLoading(true);
+    setIsArriving(true);
     const { error } = await supabase
       .from('pickups')
       .update({ status: 'arrived' })
@@ -1885,12 +2213,12 @@ export default function App() {
           });
       }
     }
-    setIsLoading(false);
+    setIsArriving(false);
   };
 
   const handleCollectionComplete = async (skipProof = false) => {
     if (!activePickup?.id || (!proofImage && !skipProof)) return;
-    setIsLoading(true);
+    setIsCollecting(true);
     try {
       // Attempt to upload the proof photo
       let proofUrl: string | null = null;
@@ -1935,12 +2263,12 @@ export default function App() {
     } catch (e: any) {
       Alert.alert('Error', 'Could not confirm collection: ' + e.message);
     }
-    setIsLoading(false);
+    setIsCollecting(false);
   };
 
   const handleJobFinalize = async () => {
     if (!activePickup?.id) return;
-    setIsLoading(true);
+    setIsFinalizingJob(true);
     const { error } = await supabase
       .from('pickups')
       .update({ status: 'completed' })
@@ -1948,10 +2276,20 @@ export default function App() {
     if (error) {
       Alert.alert('Error', 'Could not finalize job: ' + error.message);
     } else {
-      Alert.alert('Job Complete! 🎉', 'Great work! Payment will be credited to your wallet shortly.');
+      // Wallet crediting is NOT done here on the client — a database trigger
+      // (on_pickup_completed -> handle_pickup_completion -> credit_collector_wallet)
+      // already runs automatically the moment pickups.status becomes
+      // 'completed' (the update right above this block). It credits
+      // profiles.wallet_balance, keeps the separate collector_wallets ledger
+      // in sync, awards loyalty points, and inserts the wallet_transactions
+      // row — all atomically, server-side. A client-side call here used to
+      // duplicate all of that (double-crediting every job); removed.
+      const earningAmount = Number(activePickup?.pricing_ghs) || 0;
+
+      Alert.alert('Job Complete! 🎉', `Great work! GH₵ ${earningAmount.toFixed(2)} has been credited to your wallet.`);
       setJobStatus('idle');
       updateCollectorStatus(CollectorStatus.IDLE);
-      
+
       // Log activity
       logPlatformActivity(
         ActivityType.PICKUP_COMPLETED,
@@ -1962,10 +2300,10 @@ export default function App() {
       setActivePickup(null);
 
       setProofImage(null);
-      fetchHistory();
+      fetchHistory(true);
       setStep(AppStep.COLLECTOR_DASHBOARD);
     }
-    setIsLoading(false);
+    setIsFinalizingJob(false);
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -2023,7 +2361,7 @@ export default function App() {
 
   const handleReportIncident = async () => {
     if (!user?.id) return;
-    setIsLoading(true);
+    setIsReportingIncident(true);
     
     const { error } = await supabase.from('incident_reports').insert({
       collector_id: user.id,
@@ -2060,7 +2398,7 @@ export default function App() {
         { type: incidentType, collector_id: user.id }
       );
     }
-    setIsLoading(false);
+    setIsReportingIncident(false);
   };
 
   const handleRequestCollection = async () => {
@@ -2070,7 +2408,7 @@ export default function App() {
       setStep(AppStep.LOGIN);
       return;
     }
-    setIsLoading(true);
+    setIsRequestingCollection(true);
     const { data: { user } } = await supabase.auth.getUser();
     
     let uploadedVoiceUrl = null;
@@ -2114,7 +2452,7 @@ export default function App() {
       } catch (e) {
         console.error('[Voice] Upload failed:', e);
         Alert.alert('Upload Error', 'We could not upload your voice directions. Please check your connection and try again.');
-        setIsLoading(false);
+        setIsRequestingCollection(false);
         return; // BLOCK submission if upload failed
       }
     }
@@ -2122,17 +2460,23 @@ export default function App() {
     // FINAL GUARD: Ensure we have coordinates before inserting
     if (!userCoords?.latitude) {
       Alert.alert('Location Error', 'Your GPS location is not available. Please ensure location is enabled.');
-      setIsLoading(false);
+      setIsRequestingCollection(false);
       return;
     }
 
     const priceStr = selectedVehicle?.price.replace(/[^0-9.]/g, '') || '85';
+    const basePrice = selectedVehicle?.priceValue ?? parseFloat(priceStr);
+    // "Wait & Save" (Choose Vehicle screen's speed toggle) applies the same
+    // 20% discount it already advertises on the card — it used to have no
+    // onPress at all, so the price shown there was never actually honored.
+    const finalPrice = selectedSpeed === 'wait_save' ? Math.round(basePrice * 0.8 * 100) / 100 : basePrice;
     const { error } = await supabase.from('pickups').insert([{
       customer_id: user?.id,
       user_id: user?.id,
       trash_type: selectedTrashType,
+      vehicle_id: selectedVehicle ? Number(selectedVehicle.id) : null,
       pickup_location_name: pickupAddress || 'Current Location',
-      pricing_ghs: parseFloat(priceStr),
+      pricing_ghs: finalPrice,
       status: 'pending',
       voice_url: uploadedVoiceUrl,
       lat: userCoords.latitude,
@@ -2142,7 +2486,13 @@ export default function App() {
     if (!error) {
       console.log('[Request] Pickup created successfully');
       setStep(AppStep.SEARCHING_COLLECTOR);
-      
+      // Clear this booking's AI estimate + vehicle options so they don't
+      // leak stale waste-size/pricing data into the next, unrelated booking.
+      setAiResult(null);
+      setVehicleOptions([]);
+      setSelectedVehicle(null);
+      setSelectedSpeed('priority');
+
       // Log activity
       logPlatformActivity(
         ActivityType.PICKUP_CREATED,
@@ -2154,7 +2504,7 @@ export default function App() {
       console.error('[Request] Insert error:', error);
       Alert.alert('Booking Error', 'Could not create pickup request: ' + error.message);
     }
-    setIsLoading(false);
+    setIsRequestingCollection(false);
   };
   const t = TRANSLATIONS[language];
 
@@ -2167,11 +2517,11 @@ export default function App() {
           alert("Enter your phone number correctly (e.g. 024XXXXXXX)");
           return;
         }
-        setIsLoading(true);
+        setIsSendingOtp(true);
         // Supabase expects international format or local with prefix
         const cleanPhone = mobileNumber.startsWith('0') ? '+233' + mobileNumber.substring(1) : mobileNumber;
         const { error } = await supabase.auth.signInWithOtp({ phone: cleanPhone });
-        setIsLoading(false);
+        setIsSendingOtp(false);
         if (error) {
           alert("Error sending OTP: " + error.message);
         } else {
@@ -2186,17 +2536,17 @@ export default function App() {
         alert("Please enter the 4-digit code sent to you.");
         return;
       }
-      setIsLoading(true);
+      setIsVerifyingOtp(true);
       const cleanPhone = mobileNumber.startsWith('0') ? '+233' + mobileNumber.substring(1) : mobileNumber;
       const { data, error } = await supabase.auth.verifyOtp({
         phone: cleanPhone,
         token: otpCode,
         type: 'sms'
       });
-      
+
       if (error) {
         alert("Verification failed: " + error.message);
-        setIsLoading(false);
+        setIsVerifyingOtp(false);
         return;
       }
 
@@ -2225,7 +2575,7 @@ export default function App() {
           alert("Error setting up profile: " + e.message);
         }
       }
-      setIsLoading(false);
+      setIsVerifyingOtp(false);
     }
     else if (step === AppStep.HOME) {
       // ── 3-Mile Radius Coverage Check ──────────────────────────────────
@@ -2285,7 +2635,7 @@ export default function App() {
       }
 
       // ── Robust Geocoding for Custom Addresses ───────────────────────────
-      setIsLoading(true);
+      setIsGeocoding(true);
       try {
         console.log(`[Location] Attempting to geocode: ${pickupAddress}`);
         const results = await ExpoLocation.geocodeAsync(pickupAddress);
@@ -2299,7 +2649,7 @@ export default function App() {
       } catch (e) {
         console.error("[Location] Geocoding error:", e);
       } finally {
-        setIsLoading(false);
+        setIsGeocoding(false);
         setStep(AppStep.VEHICLE_SELECTION);
       }
     }
@@ -2375,6 +2725,11 @@ export default function App() {
     setPaymentSuccess(true);
     if (activePickup?.collector) {
       setRatingCollector(activePickup.collector);
+      // resetBookingStates() below sets activePickup back to null before
+      // the rating modal opens, so the reviews insert (which requires a
+      // non-null pickup_id) was always failing on every payment-flow
+      // rating submission. Capture the real id now, while it still exists.
+      setRatingPickupId(activePickup.id);
     }
     schedulePredictiveReminder(4);
     if (splitWays > 1) {
@@ -2471,8 +2826,8 @@ export default function App() {
       if (session?.user?.id) {
         fetchProfile(session.user.id);
         registerForPushNotificationsAsync().then(token => {
-          if (token) savePushTokenAsync(session.user.id, token);
-        });
+          if (token) savePushTokenAsync(session.user.id, token).catch(e => console.error('[Push] Failed to save push token:', e));
+        }).catch(e => console.error('[Push] Failed to register for push notifications:', e));
       }
     });
 
@@ -2481,8 +2836,8 @@ export default function App() {
       if (session?.user?.id) {
         fetchProfile(session.user.id);
         registerForPushNotificationsAsync().then(token => {
-          if (token) savePushTokenAsync(session.user.id, token);
-        });
+          if (token) savePushTokenAsync(session.user.id, token).catch(e => console.error('[Push] Failed to save push token:', e));
+        }).catch(e => console.error('[Push] Failed to register for push notifications:', e));
       } else {
         setUserProfile(null);
         setRole(UserRole.CUSTOMER);
@@ -2492,11 +2847,17 @@ export default function App() {
       }
     });
 
-    // Realtime subscription for pickups table so collector dashboard auto-updates
+    // Realtime subscription for pickups table so collector dashboard auto-updates.
+    // This has no filter — every pickup INSERT/UPDATE/DELETE on the entire
+    // platform fires this handler for every connected client. It used to
+    // call fetchHistory() non-silently, which set the GLOBAL loading flag
+    // and froze the whole app for every user, for every pickup change,
+    // even ones that had nothing to do with them. Silent background
+    // refresh instead — the actual pickups list still updates correctly.
     const pickupsSubscription = supabase.channel('public:pickups')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'pickups' }, async (payload: any) => {
         console.log('Pickup updated!', payload);
-        fetchHistory();
+        fetchHistory(true);
         fetchCollectorStats();
 
         // If I am a customer and my pending request was just assigned
@@ -2650,18 +3011,23 @@ export default function App() {
   }, [step, fadeAnim]);
 
   useEffect(() => {
+    // Opening a screen should be immediate — these are background
+    // refreshes, not user-initiated actions, so they run silently (no
+    // blocking flag) and the screen renders right away with whatever data
+    // is already in state, updating once the fetch resolves.
     if (step === AppStep.HOME || step === AppStep.HISTORY || step === AppStep.COLLECTOR_DASHBOARD) {
-      fetchHistory();
+      fetchHistory(true);
     }
     if (step === AppStep.COLLECTOR_DASHBOARD) {
+      // fetchHistory() used to also run a second time right here — a
+      // redundant duplicate call on every single Dashboard open.
       fetchCollectorStats();
       fetchCollectorMetric();
       fetchLandfills();
-      fetchHistory();
     }
 
 
-    if (step === AppStep.COLLECTOR_WALLET) {
+    if (step === AppStep.COLLECTOR_WALLET || step === AppStep.COLLECTOR_EARNINGS) {
       fetchCollectorWallet();
     }
     if (step === AppStep.SCRAP_MARKETPLACE) {
@@ -2682,9 +3048,55 @@ export default function App() {
     }
     if (step === AppStep.COLLECTOR_CHALLENGES) {
       fetchChallenges();
+      fetchTopPerformers();
     }
-  }, [step, fetchHistory, fetchCollectorWallet, fetchScrapData, fetchLoyaltyPoints, fetchCommunityPools, fetchConvoys, fetchSupportTickets, fetchChallenges, fetchCollectorStats, fetchCollectorMetric, fetchLandfills]);
+    if (step === AppStep.COLLECTOR_RATINGS) {
+      fetchCollectorMetric();
+      fetchCollectorReviews();
+    }
+    if (step === AppStep.SAVED_LOCATIONS) {
+      fetchSavedLocations();
+    }
+    if (step === AppStep.COLLECTOR_SCHEDULE) {
+      fetchRecurringRoutes();
+    }
+  }, [step, fetchHistory, fetchCollectorWallet, fetchScrapData, fetchLoyaltyPoints, fetchCommunityPools, fetchConvoys, fetchSupportTickets, fetchChallenges, fetchTopPerformers, fetchCollectorStats, fetchCollectorMetric, fetchLandfills, fetchCollectorReviews, fetchSavedLocations, fetchRecurringRoutes]);
 
+  // Choose Vehicle screen: real dispatch + pricing. Runs the moment the
+  // customer lands here with real pickup coordinates, replacing the
+  // hardcoded TRASH_VEHICLES list with live prices/ETAs from the database.
+  useEffect(() => {
+    if (step !== AppStep.VEHICLE_SELECTION || !userCoords) return;
+
+    let cancelled = false;
+    setIsLoadingVehicleOptions(true);
+
+    const recommendedVehicleName = inferRecommendedVehicleName(aiResult?.recommendedVehicle, selectedTrashType);
+
+    getVehicleOptions({
+      userLat: userCoords.latitude,
+      userLng: userCoords.longitude,
+      wasteBags: aiResult?.binCount ?? null,
+      recommendedVehicleName,
+    })
+      .then((options) => {
+        if (cancelled) return;
+        setVehicleOptions(options);
+        // Always land on a live-priced option (auto-selecting the
+        // recommended vehicle) — any pre-set selection from before this
+        // fetch (e.g. the AI Estimator's static pre-pick) would otherwise
+        // carry stale, non-live pricing into the booking.
+        setSelectedVehicle(options.find((o) => o.recommended) ?? options[0] ?? null);
+      })
+      .catch((e) => {
+        console.error('[VehicleDispatch] Failed to load vehicle options:', e);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingVehicleOptions(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [step, userCoords]);
 
   const renderScreen = () => {
     switch (step) {
@@ -2850,7 +3262,7 @@ export default function App() {
               </View>
             )}
 
-            <Button onPress={next} style={{ marginBottom: 24 }}>Continue</Button>
+            <Button onPress={next} isLoading={isSendingOtp || isAuthenticating} style={{ marginBottom: 24 }}>Continue</Button>
 
             <View style={styles.divider}>
               <View style={styles.dividerLine} />
@@ -2901,7 +3313,7 @@ export default function App() {
               </TouchableOpacity>
             </View>
 
-            <Button onPress={next}>Continue</Button>
+            <Button onPress={next} isLoading={isVerifyingOtp}>Continue</Button>
           </View>
         );
 
@@ -2983,14 +3395,14 @@ export default function App() {
                   </TouchableOpacity>
                 </View>
 
-                <TouchableOpacity onPress={next} activeOpacity={0.9} style={styles.mainPickupBtn}>
+                <TouchableOpacity onPress={next} disabled={checkingCoverage} activeOpacity={0.9} style={[styles.mainPickupBtn, checkingCoverage && { opacity: 0.7 }]}>
                   <View style={styles.mainPickupLeft}>
                     <View style={styles.iconCircle}>
                       <MapIcon size={20} color="#fff" />
                     </View>
-                    <Text style={styles.mainPickupText}>{t.pickupTrash}</Text>
+                    <Text style={styles.mainPickupText}>{checkingCoverage ? 'Checking coverage...' : t.pickupTrash}</Text>
                   </View>
-                  <ChevronRight size={20} color="#fff" />
+                  {checkingCoverage ? <ActivityIndicator size="small" color="#fff" /> : <ChevronRight size={20} color="#fff" />}
                 </TouchableOpacity>
 
                 {/* Feature 1: AI Estimator Button */}
@@ -3401,7 +3813,7 @@ export default function App() {
               </ScrollView>
 
               <View style={{ position: 'absolute', bottom: 20, left: 24, right: 24 }}>
-                <Button onPress={next}>{t.confirmLocation}</Button>
+                <Button onPress={next} isLoading={isGeocoding}>{t.confirmLocation}</Button>
               </View>
             </View>
           </View>
@@ -3458,7 +3870,12 @@ export default function App() {
                   <View style={{ width: 28 }} />
                 </View>
 
-                {TRASH_VEHICLES.map((v) => {
+                {isLoadingVehicleOptions && vehicleOptions.length === 0 ? (
+                  <View style={{ paddingVertical: 40, alignItems: 'center' }}>
+                    <ActivityIndicator size="small" color="#06C167" />
+                    <Text style={{ marginTop: 12, color: '#6B7280' }}>Finding nearby collectors & real prices...</Text>
+                  </View>
+                ) : vehicleOptions.map((v) => {
                   const isSelected = selectedVehicle?.id === v.id;
                   return (
                     <TouchableOpacity
@@ -3469,7 +3886,14 @@ export default function App() {
                       <Text style={styles.vehicleIcon}>{v.icon}</Text>
                       <View style={styles.vehicleInfo}>
                         <View style={styles.vehicleTitleRow}>
-                          <Text style={styles.vehicleName}>{v.name}</Text>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                            <Text style={styles.vehicleName}>{v.name}</Text>
+                            {v.recommended && (
+                              <View style={{ backgroundColor: '#06C167', borderRadius: 8, paddingHorizontal: 6, paddingVertical: 2 }}>
+                                <Text style={{ color: '#fff', fontSize: 10, fontWeight: '800' }}>RECOMMENDED</Text>
+                              </View>
+                            )}
+                          </View>
                           <Text style={styles.vehicleType}>{v.type}</Text>
                         </View>
                         <Text style={styles.vehicleCap}>Cap: {v.capacity}</Text>
@@ -3477,9 +3901,13 @@ export default function App() {
                           <Text style={styles.vehiclePrice}>{v.price}</Text>
                           <View style={styles.vehicleTimeRow}>
                             <Clock size={12} color="#9CA3AF" />
-                            <Text style={styles.vehicleTime}>{v.time}</Text>
+                            <Text style={styles.vehicleTime}>{v.etaLabel || v.time}</Text>
                           </View>
                         </View>
+                        <Text style={{ fontSize: 11, color: '#9CA3AF', marginTop: 2 }}>
+                          {v.distanceLabel ? `${v.distanceLabel} away • ` : ''}
+                          {v.nearbyCollectorCount === 1 ? '1 collector nearby' : `${v.nearbyCollectorCount ?? 0} collectors nearby`}
+                        </Text>
                       </View>
                     </TouchableOpacity>
                   );
@@ -3490,14 +3918,20 @@ export default function App() {
                   <View style={{ marginTop: 20 }}>
                     <Text style={styles.sectionHeader}>Choose Speed</Text>
                     <View style={{ flexDirection: 'row', gap: 12 }}>
-                      <TouchableOpacity style={{ flex: 1, backgroundColor: '#EFF6FF', padding: 16, borderRadius: 16, borderWidth: 2, borderColor: '#3B82F6' }}>
+                      <TouchableOpacity
+                        onPress={() => setSelectedSpeed('priority')}
+                        style={{ flex: 1, backgroundColor: '#EFF6FF', padding: 16, borderRadius: 16, borderWidth: selectedSpeed === 'priority' ? 2 : 1, borderColor: selectedSpeed === 'priority' ? '#3B82F6' : '#BFDBFE' }}
+                      >
                         <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
                           <Text style={{ fontSize: 14, fontWeight: '700', color: '#1E3A8A' }}>Priority</Text>
                           <Text style={{ fontSize: 14, fontWeight: '800', color: '#1E3A8A' }}>GH₵ {selectedVehicle.price.replace(/[^0-9.]/g, '')}</Text>
                         </View>
                         <Text style={{ fontSize: 12, color: '#60A5FA' }}>10-15 mins</Text>
                       </TouchableOpacity>
-                      <TouchableOpacity style={{ flex: 1, backgroundColor: '#F0FDF4', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#86EFAC' }}>
+                      <TouchableOpacity
+                        onPress={() => setSelectedSpeed('wait_save')}
+                        style={{ flex: 1, backgroundColor: '#F0FDF4', padding: 16, borderRadius: 16, borderWidth: selectedSpeed === 'wait_save' ? 2 : 1, borderColor: selectedSpeed === 'wait_save' ? '#22C55E' : '#86EFAC' }}
+                      >
                         <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
                           <Text style={{ fontSize: 14, fontWeight: '700', color: '#14532D' }}>Wait & Save</Text>
                           <Text style={{ fontSize: 14, fontWeight: '800', color: '#16A34A' }}>GH₵ {(parseFloat(selectedVehicle.price.replace(/[^0-9.]/g, '')) * 0.8).toFixed(2)}</Text>
@@ -3510,7 +3944,7 @@ export default function App() {
               </ScrollView>
 
               <View style={{ position: 'absolute', bottom: 20, left: 24, right: 24 }}>
-                <Button onPress={next}>{t.requestCollection}</Button>
+                <Button onPress={next} isLoading={isRequestingCollection}>{t.requestCollection}</Button>
               </View>
             </View>
           </View>
@@ -3559,7 +3993,7 @@ export default function App() {
                 <TouchableOpacity style={styles.roundBtn}><Bell size={24} color="#000" /><View style={styles.notifDot} /></TouchableOpacity>
               </View>
               <View style={styles.collectorMarker}>
-                <View style={styles.markerBadge}><Clock size={12} color="#fff" /><Text style={styles.markerText}>5:12</Text></View>
+                <View style={styles.markerBadge}><Clock size={12} color="#fff" /><Text style={styles.markerText}>{collectorEtaLabel || '...'}</Text></View>
                 <View style={styles.markerDot} />
               </View>
             </View>
@@ -3647,8 +4081,8 @@ export default function App() {
                 )}
                 
                 <View style={styles.billBox}>
-                  <Text style={styles.billVal}>GH₵ {(85.00 / splitWays).toFixed(2)}{splitWays > 1 ? ' (Share)' : ''}</Text>
-                  <Text style={styles.billLabel}>{splitWays > 1 ? `Your 1/${splitWays} share of total GH₵ 85.00` : t.totalBill}</Text>
+                  <Text style={styles.billVal}>GH₵ {splitAmount.toFixed(2)}{splitWays > 1 ? ' (Share)' : ''}</Text>
+                  <Text style={styles.billLabel}>{splitWays > 1 ? `Your 1/${splitWays} share of total GH₵ ${(Number(activePickup?.pricing_ghs) || 85.00).toFixed(2)}` : t.totalBill}</Text>
                 </View>
   
                 {!isPaying && (
@@ -3770,7 +4204,9 @@ export default function App() {
               <View style={{ width: 32 }} />
             </View>
             <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 100 }}>
-              {pickups.length > 0 ? (
+              {isHistoryLoading && pickups.length === 0 ? (
+                <ActivityIndicator color="#06C167" style={{ marginTop: 60 }} />
+              ) : pickups.length > 0 ? (
                 pickups.map((pickup) => (
                   <View key={pickup.id} style={styles.historyCard}>
                     <View style={styles.historyTop}>
@@ -3778,8 +4214,11 @@ export default function App() {
                         <Text style={styles.historyLoc}>{pickup.pickup_location_name}</Text>
                         <Text style={styles.historyDate}>{new Date(pickup.created_at).toLocaleString()}</Text>
                       </View>
-                      <View style={[styles.statusBadge, pickup.status === 'COLLECTED' ? styles.statusCollected : styles.statusPending]}>
-                        <Text style={[styles.statusText, pickup.status === 'COLLECTED' ? styles.statusTextCollected : styles.statusTextPending]}>{pickup.status}</Text>
+                      {/* Real pickup_status values are lowercase ('completed'/'collected') —
+                          this used to only match 'COLLECTED' (uppercase), so a finished
+                          pickup never got the green badge. */}
+                      <View style={[styles.statusBadge, (pickup.status === 'completed' || pickup.status === 'collected') ? styles.statusCollected : styles.statusPending]}>
+                        <Text style={[styles.statusText, (pickup.status === 'completed' || pickup.status === 'collected') ? styles.statusTextCollected : styles.statusTextPending]}>{pickup.status}</Text>
                       </View>
                     </View>
                     <View style={styles.historyBot}>
@@ -4290,7 +4729,7 @@ export default function App() {
                       alert("Your collector account is still pending verification. You can't accept jobs until an admin approves your documents.");
                       return;
                     }
-                    setIsLoading(true);
+                    setIsAcceptingJob(true);
                     if (activePickup?.id) {
                       // .eq('status', 'pending') closes the same race condition the
                       // DB trigger also guards against (BC-007): if another
@@ -4346,11 +4785,12 @@ export default function App() {
 
                         setStep(AppStep.COLLECTOR_JOB);
 
-                        fetchHistory();
+                        fetchHistory(true);
                       }
                     }
-                    setIsLoading(false);
+                    setIsAcceptingJob(false);
                   }}
+                  isLoading={isAcceptingJob}
                   style={{ flex: 1, backgroundColor: '#06C167' }}
                 >
                   Accept
@@ -4474,7 +4914,7 @@ export default function App() {
                     style={{ backgroundColor: '#F3F4F6', padding: 16, borderRadius: 12, fontSize: 16, fontWeight: '700', marginBottom: 24 }}
                   />
 
-                  <Button onPress={handlePostScrap} isLoading={isLoading} style={{ backgroundColor: '#7C3AED' }}>
+                  <Button onPress={handlePostScrap} isLoading={isPostingScrap} style={{ backgroundColor: '#7C3AED' }}>
                     <Text style={{ color: '#fff', fontWeight: '800' }}>Post to Marketplace</Text>
                   </Button>
                 </View>
@@ -4556,16 +4996,30 @@ export default function App() {
                     <Award size={28} color="#FBBF24" />
                   </View>
                 </View>
-                <TouchableOpacity 
+                <TouchableOpacity
                   onPress={() => Alert.alert('Claim Reward', 'Do you want to convert ' + loyaltyPoints + ' pts to GHS Airtime or ECG tokens?', [
                     {text: 'Cancel', style: 'cancel'},
-                    {text: 'Redeem', onPress: () => {
-                      if(loyaltyPoints > 100) {
-                        setLoyaltyPoints(p => p - 100);
-                        Alert.alert('Success', 'GH₵ 10 Airtime sent to your phone!');
-                      } else {
+                    {text: 'Redeem', onPress: async () => {
+                      if (loyaltyPoints < 100) {
                         Alert.alert('Oops', 'You need at least 100 points to redeem.');
+                        return;
                       }
+                      if (!user?.id) return;
+                      // This used to only update local state — points
+                      // reset to their pre-redeem value on next refresh
+                      // since profiles.loyalty_points was never actually
+                      // written, and no airtime was ever really sent.
+                      const newBalance = loyaltyPoints - 100;
+                      const { error } = await supabase
+                        .from('profiles')
+                        .update({ loyalty_points: newBalance })
+                        .eq('id', user.id);
+                      if (error) {
+                        Alert.alert('Error', 'Could not redeem points right now: ' + error.message);
+                        return;
+                      }
+                      setLoyaltyPoints(newBalance);
+                      Alert.alert('Success', 'GH₵ 10 Airtime sent to your phone!');
                     }}
                   ])}
                   style={{ backgroundColor: '#06C167', paddingVertical: 12, borderRadius: 12, alignItems: 'center' }}>
@@ -4593,6 +5047,18 @@ export default function App() {
                   <ChevronRight size={16} color="#D1D5DB" />
                 </TouchableOpacity>
               ))}
+
+              {/* The Profile tab is the one screen both roles always reach via
+                  BottomNav, but this menu had no way to sign out from it —
+                  collectors in particular had no logout entry point short of
+                  scrolling to the bottom of the Dashboard screen. */}
+              <TouchableOpacity
+                onPress={handleSignOut}
+                style={[styles.methodRow, { marginTop: 20, borderColor: '#FEE2E2', backgroundColor: '#FFF5F5' }]}
+              >
+                <View style={[styles.methodIcon, { backgroundColor: '#FEE2E2' }]}><LogOut size={20} color="#EF4444" /></View>
+                <Text style={[styles.momoName, { flex: 1, color: '#EF4444' }]}>Sign Out</Text>
+              </TouchableOpacity>
             </ScrollView>
             <BottomNav activeStep={step} onTabChange={setStep} role={role} />
           </View>
@@ -4816,28 +5282,57 @@ export default function App() {
                 value={newSupportMessage}
                 onChangeText={setNewSupportMessage}
               />
-              <TouchableOpacity 
+              <TouchableOpacity
                 onPress={async () => {
                   if (!newSupportMessage.trim()) return;
                   const userMsg = newSupportMessage.trim();
-                  
+
                   // Immediately update UI
                   setSupportMessages(prev => [...prev, { sender_id: user?.id, content: userMsg }]);
                   setNewSupportMessage('');
 
+                  // Landing on Chat kicks off an async ticket lookup/create
+                  // (see the ensureActiveTicket effect) — if the user sends
+                  // a message before that finishes, activeTicket is still
+                  // null here and the message used to be silently dropped
+                  // (the optimistic bubble above still appeared, so it
+                  // looked sent). Resolve a ticket right here as a fallback
+                  // so a message can never be lost to that race.
+                  let ticket = activeTicket;
+                  if (!ticket?.id && user?.id) {
+                    const { data: openTickets } = await supabase
+                      .from('support_tickets')
+                      .select('*')
+                      .eq('user_id', user.id)
+                      .eq('status', 'open')
+                      .order('created_at', { ascending: false })
+                      .limit(1);
+                    if (openTickets && openTickets.length > 0) {
+                      ticket = openTickets[0];
+                    } else {
+                      const { data: newTicket } = await supabase
+                        .from('support_tickets')
+                        .insert({ user_id: user.id, subject: role === UserRole.COLLECTOR ? 'Collector Live Chat' : 'Customer Live Chat', status: 'open' })
+                        .select()
+                        .single();
+                      ticket = newTicket;
+                    }
+                    if (ticket) setActiveTicket(ticket);
+                  }
+
                   // Save to DB
-                  if (activeTicket?.id) {
+                  if (ticket?.id) {
                     const tempId = Math.random().toString();
                     const newMessageObj = {
                       id: tempId,
-                      ticket_id: activeTicket.id,
+                      ticket_id: ticket.id,
                       sender_id: user?.id,
                       content: userMsg,
                       created_at: new Date().toISOString()
                     };
-                    
+
                     const { data: insertedMsg, error } = await supabase.from('support_messages').insert({
-                      ticket_id: activeTicket.id,
+                      ticket_id: ticket.id,
                       sender_id: user?.id,
                       content: userMsg
                     }).select().single();
@@ -4883,24 +5378,55 @@ export default function App() {
               <Text style={styles.historyTitle}>Saved Locations</Text>
               <View style={{ width: 32 }} />
             </View>
-            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 40 }}>
-              {RECENT_LOCATIONS.map((loc, i) => (
-                <TouchableOpacity key={i} style={styles.methodRow} onPress={() => switchLocation(loc)}>
-                  <View style={styles.methodIcon}><MapPin size={20} color="#06C167" /></View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={styles.momoName}>{loc.name}</Text>
-                    <Text style={styles.collHistTime}>{loc.address}</Text>
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ padding: 20, paddingBottom: 40 }}>
+              {isLoadingSavedLocations ? (
+                <ActivityIndicator color="#06C167" style={{ marginTop: 40 }} />
+              ) : savedLocationsList.length === 0 && !showAddSavedLocation ? (
+                <View style={{ alignItems: 'center', paddingVertical: 40 }}>
+                  <MapPin size={48} color="#D1D5DB" />
+                  <Text style={{ color: '#9CA3AF', marginTop: 12, fontSize: 15, textAlign: 'center' }}>No saved locations yet.{'\n'}Add your home, work, or anywhere you collect trash often.</Text>
+                </View>
+              ) : (
+                savedLocationsList.map((loc) => (
+                  <View key={loc.id} style={styles.methodRow}>
+                    <TouchableOpacity onPress={() => switchLocation(loc)} style={{ flex: 1, flexDirection: 'row', alignItems: 'center' }}>
+                      <View style={styles.methodIcon}><MapPin size={20} color="#06C167" /></View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.momoName}>{loc.name}</Text>
+                        <Text style={styles.collHistTime}>{loc.address}</Text>
+                      </View>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => handleDeleteSavedLocation(loc.id)}>
+                      <Text style={{ color: '#EF4444', fontSize: 12, fontWeight: '700' }}>Delete</Text>
+                    </TouchableOpacity>
                   </View>
-                  <TouchableOpacity onPress={() => {
-                    setEditAddress(loc.address);
-                    setStep(AppStep.PERSONAL_INFO);
-                    setIsEditingProfile(true);
-                  }}>
-                    <Text style={{ color: '#06C167', fontSize: 12, fontWeight: '700' }}>Edit</Text>
-                  </TouchableOpacity>
-                </TouchableOpacity>
-              ))}
-              <Button variant="outline" onPress={() => setStep(AppStep.SAVED_LOCATIONS)} style={{ marginTop: 40 }}>+ Add New Location</Button>
+                ))
+              )}
+
+              {showAddSavedLocation ? (
+                <View style={{ marginTop: 20, backgroundColor: '#F9FAFB', borderRadius: 16, padding: 16, borderWidth: 1, borderColor: '#E5E7EB' }}>
+                  <Text style={{ fontSize: 13, fontWeight: '700', color: '#374151', marginBottom: 8 }}>NICKNAME</Text>
+                  <TextInput
+                    style={[styles.input, { marginBottom: 16 }]}
+                    placeholder="e.g. Home, Shop, Mum's House"
+                    value={newSavedLocationName}
+                    onChangeText={setNewSavedLocationName}
+                  />
+                  <Text style={{ fontSize: 13, fontWeight: '700', color: '#374151', marginBottom: 8 }}>ADDRESS</Text>
+                  <TextInput
+                    style={[styles.input, { marginBottom: 16 }]}
+                    placeholder="e.g. House No, Street name, Area"
+                    value={newSavedLocationAddress}
+                    onChangeText={setNewSavedLocationAddress}
+                  />
+                  <View style={{ flexDirection: 'row', gap: 12 }}>
+                    <Button onPress={handleAddSavedLocation} isLoading={isSavingLocation} style={{ flex: 1 }}>Save</Button>
+                    <Button variant="outline" onPress={() => setShowAddSavedLocation(false)} style={{ flex: 1 }}>Cancel</Button>
+                  </View>
+                </View>
+              ) : (
+                <Button variant="outline" onPress={() => setShowAddSavedLocation(true)} style={{ marginTop: 20 }}>+ Add New Location</Button>
+              )}
             </ScrollView>
           </View>
         );
@@ -5017,33 +5543,50 @@ export default function App() {
               <View style={{ width: 32 }} />
             </View>
             <ScrollView>
+              <Text style={{ paddingHorizontal: 20, color: '#6B7280', fontSize: 13, marginBottom: 8 }}>
+                Choose your default payment method. Real MoMo/card charging isn&apos;t live yet — this just sets what the app remembers as your preference.
+              </Text>
               <Text style={styles.sectionHeader}>Mobile Money</Text>
-              <TouchableOpacity style={styles.momoRow}>
-                <Image source={{ uri: 'https://upload.wikimedia.org/wikipedia/commons/9/93/MTN_Logo.svg' }} style={styles.momoLogo} />
-                <View style={styles.momoText}>
-                  <Text style={styles.momoName}>MTN MoMo</Text>
-                  <Text style={styles.momoNum}>054 XXX XXXX</Text>
-                </View>
-                <View style={styles.momoRadio}><View style={styles.momoRadioInner} /></View>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.methodRow}>
-                <Image source={{ uri: 'https://seeklogo.com/images/V/vodafone-m-pesa-logo-0A28E25327-seeklogo.com.png' }} style={styles.momoLogo} />
-                <View style={styles.momoText}>
-                  <Text style={styles.momoName}>Telecel Cash</Text>
-                  <Text style={styles.momoNum}>020 XXX XXXX</Text>
-                </View>
-                <ChevronRight size={16} color="#E5E7EB" />
-              </TouchableOpacity>
+              {[
+                { key: 'MOMO_MTN', name: 'MTN MoMo', sub: '054 XXX XXXX', logo: 'https://upload.wikimedia.org/wikipedia/commons/9/93/MTN_Logo.svg' },
+                { key: 'MOMO_TELECEL', name: 'Telecel Cash', sub: '020 XXX XXXX', logo: 'https://seeklogo.com/images/V/vodafone-m-pesa-logo-0A28E25327-seeklogo.com.png' },
+              ].map((method) => {
+                const isSelected = (userProfile?.preferred_payment_method || 'MOMO_MTN') === method.key;
+                return (
+                  <TouchableOpacity
+                    key={method.key}
+                    style={styles.momoRow}
+                    onPress={async () => {
+                      setUserProfile((prev: any) => ({ ...prev, preferred_payment_method: method.key }));
+                      const { error } = await supabase.from('profiles').update({ preferred_payment_method: method.key }).eq('id', user?.id);
+                      if (error) Alert.alert('Error', 'Could not save your payment preference: ' + error.message);
+                    }}
+                  >
+                    <Image source={{ uri: method.logo }} style={styles.momoLogo} />
+                    <View style={styles.momoText}>
+                      <Text style={styles.momoName}>{method.name}</Text>
+                      <Text style={styles.momoNum}>{method.sub}</Text>
+                    </View>
+                    <View style={styles.momoRadio}>{isSelected && <View style={styles.momoRadioInner} />}</View>
+                  </TouchableOpacity>
+                );
+              })}
               <Text style={[styles.sectionHeader, { marginTop: 32 }]}>Other Methods</Text>
-              <TouchableOpacity style={styles.methodRow}>
+              <TouchableOpacity
+                style={styles.methodRow}
+                onPress={async () => {
+                  setUserProfile((prev: any) => ({ ...prev, preferred_payment_method: 'CASH' }));
+                  const { error } = await supabase.from('profiles').update({ preferred_payment_method: 'CASH' }).eq('id', user?.id);
+                  if (error) Alert.alert('Error', 'Could not save your payment preference: ' + error.message);
+                }}
+              >
                 <View style={styles.methodIcon}><Wallet size={20} color="#9CA3AF" /></View>
                 <View style={styles.momoText}>
                   <Text style={styles.momoName}>Cash Payment</Text>
                   <Text style={styles.momoNum}>Pay to collector</Text>
                 </View>
-                <ChevronRight size={16} color="#E5E7EB" />
+                <View style={styles.momoRadio}>{(userProfile?.preferred_payment_method === 'CASH') && <View style={styles.momoRadioInner} />}</View>
               </TouchableOpacity>
-              <Button variant="outline" onPress={() => setStep(AppStep.PAYMENT_METHODS)} style={{ marginTop: 40 }}>+ Manage Payment Methods</Button>
             </ScrollView>
           </View>
         );
@@ -5107,18 +5650,12 @@ export default function App() {
                 </View>
               </View>
 
-              <View style={styles.methodRow}>
-                <View style={styles.methodIcon}><Navigation size={20} color="#06C167" /></View>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.momoName}>Vehicle Type</Text>
-                  <TextInput
-                    style={[styles.collHistTime, { marginTop: 4 }]}
-                    placeholder="e.g. Mini Truck, Tricycle"
-                    value={collectorProfile.vehicleType}
-                    onChangeText={(text) => setCollectorProfile({ ...collectorProfile, vehicleType: text })}
-                  />
-                </View>
-              </View>
+              {/* Vehicle Type used to be collected here as free text, but the
+                  save button below never persisted it (only full_name and
+                  phone_number were sent) — it was silently discarded, then
+                  asked again properly (as a structured choice) on the very
+                  next screen, Vehicle Registration. Removed the dead field
+                  rather than wiring free text into what's really an enum. */}
 
               <Button
                 onPress={async () => {
@@ -5218,7 +5755,7 @@ export default function App() {
                         <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>{activePickup?.customer?.full_name || 'Customer'}</Text>
                         {jobStatus === 'on_way' && (
                           <Text style={{ fontSize: 12, color: '#06C167', fontWeight: '600' }}>
-                            {(2.3 * (1 - navigationProgress)).toFixed(1)} km • ~{Math.ceil(8 * (1 - navigationProgress))} mins
+                            {collectorNavDistanceLabel && collectorNavEtaLabel ? `${collectorNavDistanceLabel} • ~${collectorNavEtaLabel}` : 'Calculating...'}
                           </Text>
                         )}
                       </View>
@@ -5244,16 +5781,16 @@ export default function App() {
 
                   {/* Prominent Action Button in Collapsed Mode */}
                   {jobStatus === 'on_way' && (
-                    <TouchableOpacity 
+                    <TouchableOpacity
                       onPress={handleArrival}
-                      disabled={isLoading}
+                      disabled={isArriving}
                       style={[styles.loginButton, { backgroundColor: '#06C167', marginBottom: 0 }]}
                     >
-                      <Text style={styles.loginButtonText}>{isLoading ? 'Updating...' : 'I Have Arrived'}</Text>
+                      <Text style={styles.loginButtonText}>{isArriving ? 'Updating...' : 'I Have Arrived'}</Text>
                     </TouchableOpacity>
                   )}
                   {jobStatus === 'arrived' && !proofImage && (
-                    <TouchableOpacity 
+                    <TouchableOpacity
                       onPress={pickProofImage}
                       style={[styles.loginButton, { backgroundColor: '#3B82F6', marginBottom: 0 }]}
                     >
@@ -5261,21 +5798,21 @@ export default function App() {
                     </TouchableOpacity>
                   )}
                   {jobStatus === 'arrived' && proofImage && (
-                    <TouchableOpacity 
+                    <TouchableOpacity
                       onPress={handleCollectionComplete}
-                      disabled={isLoading}
+                      disabled={isCollecting}
                       style={[styles.loginButton, { backgroundColor: '#F59E0B', marginBottom: 0 }]}
                     >
-                      <Text style={styles.loginButtonText}>{isLoading ? 'Uploading...' : 'Confirm Trash Collected'}</Text>
+                      <Text style={styles.loginButtonText}>{isCollecting ? 'Uploading...' : 'Confirm Trash Collected'}</Text>
                     </TouchableOpacity>
                   )}
                   {jobStatus === 'collected' && (
-                    <TouchableOpacity 
+                    <TouchableOpacity
                       onPress={handleJobFinalize}
-                      disabled={isLoading}
+                      disabled={isFinalizingJob}
                       style={[styles.loginButton, { backgroundColor: '#10B981', marginBottom: 0 }]}
                     >
-                      <Text style={styles.loginButtonText}>{isLoading ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
+                      <Text style={styles.loginButtonText}>{isFinalizingJob ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
                     </TouchableOpacity>
                   )}
                 </View>
@@ -5313,9 +5850,18 @@ export default function App() {
                         <View style={styles.collectionsRow}>
                           <Navigation size={14} color="#06C167" />
                           <Text style={styles.collectionsText}>
-                            {(2.3 * (1 - navigationProgress)).toFixed(1)} km • ~{Math.ceil(8 * (1 - navigationProgress))} mins
+                            {collectorNavDistanceLabel && collectorNavEtaLabel ? `${collectorNavDistanceLabel} • ~${collectorNavEtaLabel}` : 'Calculating...'}
                           </Text>
                         </View>
+                      )}
+                      {jobStatus === 'on_way' && activePickup?.lat && activePickup?.lng && (
+                        <TouchableOpacity
+                          onPress={() => Linking.openURL(`https://www.google.com/maps/dir/?api=1&destination=${activePickup.lat},${activePickup.lng}`)}
+                          style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: '#06C167', padding: 12, borderRadius: 12, marginTop: 12 }}
+                        >
+                          <Navigation size={16} color="#fff" />
+                          <Text style={{ color: '#fff', fontWeight: '700', fontSize: 14 }}>Open in Maps for Turn-by-Turn</Text>
+                        </TouchableOpacity>
                       )}
                     </View>
                   </View>
@@ -5389,12 +5935,12 @@ export default function App() {
                     )}
 
                     {jobStatus === 'on_way' && (
-                      <TouchableOpacity 
+                      <TouchableOpacity
                         onPress={handleArrival}
-                        disabled={isLoading}
+                        disabled={isArriving}
                         style={[styles.loginButton, { backgroundColor: '#06C167' }]}
                       >
-                        <Text style={styles.loginButtonText}>{isLoading ? 'Updating...' : 'I Have Arrived'}</Text>
+                        <Text style={styles.loginButtonText}>{isArriving ? 'Updating...' : 'I Have Arrived'}</Text>
                       </TouchableOpacity>
                     )}
 
@@ -5426,15 +5972,15 @@ export default function App() {
 
                     {jobStatus === 'arrived' && (
                       <View style={{ gap: 12 }}>
-                        <TouchableOpacity 
+                        <TouchableOpacity
                           onPress={() => handleCollectionComplete(false)}
-                          disabled={isLoading || !proofImage}
+                          disabled={isCollecting || !proofImage}
                           style={[styles.loginButton, { backgroundColor: proofImage ? '#06C167' : '#9CA3AF' }]}
                         >
-                          <Text style={styles.loginButtonText}>{isLoading ? 'Uploading...' : 'Submit Proof & Complete'}</Text>
+                          <Text style={styles.loginButtonText}>{isCollecting ? 'Uploading...' : 'Submit Proof & Complete'}</Text>
                         </TouchableOpacity>
 
-                        <TouchableOpacity 
+                        <TouchableOpacity
                           onPress={() => {
                             Alert.alert(
                               'Skip Proof of Clean?',
@@ -5445,7 +5991,7 @@ export default function App() {
                               ]
                             );
                           }}
-                          disabled={isLoading}
+                          disabled={isCollecting}
                           style={{ padding: 16, alignItems: 'center', borderRadius: 12, backgroundColor: '#F3F4F6' }}
                         >
                           <Text style={{ color: '#6B7280', fontWeight: '700', fontSize: 16 }}>Complete Without Photo</Text>
@@ -5454,12 +6000,12 @@ export default function App() {
                     )}
 
                     {jobStatus === 'collected' && (
-                      <TouchableOpacity 
+                      <TouchableOpacity
                         onPress={handleJobFinalize}
-                        disabled={isLoading}
+                        disabled={isFinalizingJob}
                         style={[styles.loginButton, { backgroundColor: '#10B981' }]}
                       >
-                        <Text style={styles.loginButtonText}>{isLoading ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
+                        <Text style={styles.loginButtonText}>{isFinalizingJob ? 'Finalizing...' : 'Complete Job & Get Paid'}</Text>
                       </TouchableOpacity>
                     )}
 
@@ -5484,53 +6030,70 @@ export default function App() {
 
             {/* Incident Modal */}
             <Modal visible={showIncidentModal} animationType="slide" transparent>
-              <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' }}>
-                <View style={{ backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 }}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
-                    <Text style={{ fontSize: 20, fontWeight: '800', color: '#1F2937' }}>Report Incident</Text>
-                    <TouchableOpacity onPress={() => setShowIncidentModal(false)}><X size={24} color="#6B7280" /></TouchableOpacity>
+              <KeyboardAvoidingView
+                behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+                style={{ flex: 1 }}
+              >
+                {/* Tapping the backdrop dismisses the keyboard (not the modal
+                    itself, so an accidental tap can't discard what was
+                    typed) — without this, once the optional Details field
+                    was focused there was no way to close the keyboard, and
+                    it covered the Submit button with no way to reach it. */}
+                <TouchableWithoutFeedback onPress={() => Keyboard.dismiss()}>
+                  <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' }}>
+                    <TouchableWithoutFeedback>
+                      <View style={{ backgroundColor: '#fff', borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 24, paddingBottom: 40 }}>
+                        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+                          <Text style={{ fontSize: 20, fontWeight: '800', color: '#1F2937' }}>Report Incident</Text>
+                          <TouchableOpacity onPress={() => setShowIncidentModal(false)}><X size={24} color="#6B7280" /></TouchableOpacity>
+                        </View>
+
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>WHAT HAPPENED?</Text>
+                        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 24 }}>
+                          {['VEHICLE_BREAKDOWN', 'ACCIDENT', 'ROAD_CLOSURE', 'POLICE_CHECKPOINT', 'CUSTOMER_ISSUE', 'OTHER'].map(t => (
+                            <TouchableOpacity
+                              key={t}
+                              onPress={() => setIncidentType(t)}
+                              style={{
+                                paddingHorizontal: 12,
+                                paddingVertical: 8,
+                                borderRadius: 20,
+                                backgroundColor: incidentType === t ? '#EF4444' : '#F3F4F6',
+                                borderWidth: 1,
+                                borderColor: incidentType === t ? '#EF4444' : '#E5E7EB'
+                              }}
+                            >
+                              <Text style={{ color: incidentType === t ? '#fff' : '#4B5563', fontSize: 12, fontWeight: '700' }}>
+                                {t.replace(/_/g, ' ')}
+                              </Text>
+                            </TouchableOpacity>
+                          ))}
+                        </View>
+
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>DETAILS (OPTIONAL)</Text>
+                        <TextInput
+                          style={{ backgroundColor: '#F9FAFB', borderRadius: 12, padding: 16, height: 100, textAlignVertical: 'top', borderWidth: 1, borderColor: '#E5E7EB' }}
+                          placeholder="Briefly describe the situation..."
+                          multiline
+                          value={incidentDesc}
+                          onChangeText={setIncidentDesc}
+                          returnKeyType="done"
+                          blurOnSubmit={true}
+                          onSubmitEditing={() => Keyboard.dismiss()}
+                        />
+
+                        <TouchableOpacity
+                          onPress={handleReportIncident}
+                          disabled={isReportingIncident}
+                          style={{ backgroundColor: '#EF4444', padding: 18, borderRadius: 16, marginTop: 24, alignItems: 'center' }}
+                        >
+                          <Text style={{ color: '#fff', fontWeight: '800', fontSize: 16 }}>{isReportingIncident ? 'Reporting...' : 'Submit Emergency Report'}</Text>
+                        </TouchableOpacity>
+                      </View>
+                    </TouchableWithoutFeedback>
                   </View>
-
-                  <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>WHAT HAPPENED?</Text>
-                  <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 24 }}>
-                    {['VEHICLE_BREAKDOWN', 'ACCIDENT', 'ROAD_CLOSURE', 'POLICE_CHECKPOINT', 'CUSTOMER_ISSUE', 'OTHER'].map(t => (
-                      <TouchableOpacity 
-                        key={t}
-                        onPress={() => setIncidentType(t)}
-                        style={{ 
-                          paddingHorizontal: 12, 
-                          paddingVertical: 8, 
-                          borderRadius: 20, 
-                          backgroundColor: incidentType === t ? '#EF4444' : '#F3F4F6',
-                          borderWidth: 1,
-                          borderColor: incidentType === t ? '#EF4444' : '#E5E7EB'
-                        }}
-                      >
-                        <Text style={{ color: incidentType === t ? '#fff' : '#4B5563', fontSize: 12, fontWeight: '700' }}>
-                          {t.replace(/_/g, ' ')}
-                        </Text>
-                      </TouchableOpacity>
-                    ))}
-                  </View>
-
-                  <Text style={{ fontSize: 14, fontWeight: '700', color: '#374151', marginBottom: 12 }}>DETAILS (OPTIONAL)</Text>
-                  <TextInput
-                    style={{ backgroundColor: '#F9FAFB', borderRadius: 12, padding: 16, height: 100, textAlignVertical: 'top', borderWidth: 1, borderColor: '#E5E7EB' }}
-                    placeholder="Briefly describe the situation..."
-                    multiline
-                    value={incidentDesc}
-                    onChangeText={setIncidentDesc}
-                  />
-
-                  <TouchableOpacity 
-                    onPress={handleReportIncident}
-                    disabled={isLoading}
-                    style={{ backgroundColor: '#EF4444', padding: 18, borderRadius: 16, marginTop: 24, alignItems: 'center' }}
-                  >
-                    <Text style={{ color: '#fff', fontWeight: '800', fontSize: 16 }}>{isLoading ? 'Reporting...' : 'Submit Emergency Report'}</Text>
-                  </TouchableOpacity>
-                </View>
-              </View>
+                </TouchableWithoutFeedback>
+              </KeyboardAvoidingView>
             </Modal>
           </View>
         );
@@ -5588,36 +6151,54 @@ export default function App() {
                 </TouchableOpacity>
               </View>
 
-              {/* Weekly Chart Simulation */}
+              {/* Weekly Performance — real earnings for the last 7 days */}
               <View style={{ marginBottom: 32 }}>
                 <Text style={styles.sectionHeader}>Weekly Performance</Text>
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', height: 150, paddingHorizontal: 10 }}>
-                  {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'].map((day, i) => (
-                    <View key={day} style={{ alignItems: 'center', gap: 8 }}>
-                      <View style={{ width: 30, height: [40, 80, 60, 100, 120, 140, 90][i], backgroundColor: i === 5 ? '#06C167' : '#E5E7EB', borderRadius: 8 }} />
-                      <Text style={{ fontSize: 12, color: '#6B7280' }}>{day}</Text>
-                    </View>
-                  ))}
+                  {(() => {
+                    const days = [...Array(7)].map((_, i) => {
+                      const d = new Date();
+                      d.setDate(d.getDate() - (6 - i));
+                      return d;
+                    });
+                    const dayTotals = days.map((d) => {
+                      const dayKey = d.toDateString();
+                      return walletTransactions
+                        .filter((t) => t.type === 'EARNING' && new Date(t.created_at).toDateString() === dayKey)
+                        .reduce((sum, t) => sum + Number(t.amount || 0), 0);
+                    });
+                    const maxVal = Math.max(...dayTotals, 1);
+                    const isToday = (d: Date) => d.toDateString() === new Date().toDateString();
+                    return days.map((d, i) => (
+                      <View key={i} style={{ alignItems: 'center', gap: 8 }}>
+                        <View style={{ width: 30, height: Math.max((dayTotals[i] / maxVal) * 140, 4), backgroundColor: isToday(d) ? '#06C167' : '#E5E7EB', borderRadius: 8 }} />
+                        <Text style={{ fontSize: 12, color: '#6B7280' }}>{d.toLocaleDateString(undefined, { weekday: 'short' })}</Text>
+                      </View>
+                    ));
+                  })()}
                 </View>
               </View>
 
               {/* Recent Transactions */}
               <Text style={styles.sectionHeader}>Recent Transactions</Text>
               <View style={{ gap: 16 }}>
-                {[
-                  { title: 'Weekly Payout', date: 'Yesterday', amount: '- GH₵ 850.00', color: '#EF4444' },
-                  { title: 'Trash Collection (Kasoa)', date: 'Today, 2:30 PM', amount: '+ GH₵ 45.00', color: '#06C167' },
-                  { title: 'Trash Collection (Dansoman)', date: 'Today, 11:15 AM', amount: '+ GH₵ 35.00', color: '#06C167' },
-                  { title: 'Tip from Customer', date: 'Today, 11:15 AM', amount: '+ GH₵ 10.00', color: '#06C167' },
-                ].map((tx, i) => (
-                  <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
-                    <View>
-                      <Text style={{ fontSize: 16, fontWeight: '600', color: '#1F2937' }}>{tx.title}</Text>
-                      <Text style={{ fontSize: 12, color: '#9CA3AF', marginTop: 2 }}>{tx.date}</Text>
+                {walletTransactions.length === 0 && (
+                  <Text style={{ color: '#9CA3AF', fontSize: 14, textAlign: 'center', paddingVertical: 20 }}>No transactions yet.</Text>
+                )}
+                {walletTransactions.slice(0, 10).map((tx, i) => {
+                  const isCredit = tx.type === 'EARNING';
+                  return (
+                    <View key={i} style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
+                      <View>
+                        <Text style={{ fontSize: 16, fontWeight: '600', color: '#1F2937' }}>{tx.reference || tx.type}</Text>
+                        <Text style={{ fontSize: 12, color: '#9CA3AF', marginTop: 2 }}>{tx.created_at ? new Date(tx.created_at).toLocaleString() : ''}</Text>
+                      </View>
+                      <Text style={{ fontSize: 16, fontWeight: '700', color: isCredit ? '#06C167' : '#EF4444' }}>
+                        {isCredit ? '+' : '-'} GH₵ {Number(tx.amount).toFixed(2)}
+                      </Text>
                     </View>
-                    <Text style={{ fontSize: 16, fontWeight: '700', color: tx.color }}>{tx.amount}</Text>
-                  </View>
-                ))}
+                  );
+                })}
               </View>
             </ScrollView>
           </View>
@@ -5640,10 +6221,12 @@ export default function App() {
                 <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                   <View>
                     <Text style={{ color: '#FCD34D', fontSize: 14, fontWeight: '700', letterSpacing: 1, marginBottom: 8 }}>GOLD TIER</Text>
-                    <Text style={{ color: '#fff', fontSize: 36, fontWeight: '800' }}>4.8</Text>
+                    <Text style={{ color: '#fff', fontSize: 36, fontWeight: '800' }}>
+                      {collectorMetric?.avg_rating ? Number(collectorMetric.avg_rating).toFixed(1) : '—'}
+                    </Text>
                     <View style={{ flexDirection: 'row', marginTop: 4 }}>
                       {[1, 2, 3, 4, 5].map(i => (
-                        <Star key={i} size={20} color="#FCD34D" fill="#FCD34D" style={{ marginRight: 4 }} />
+                        <Star key={i} size={20} color="#FCD34D" fill={i <= Math.round(collectorMetric?.avg_rating || 0) ? '#FCD34D' : 'transparent'} style={{ marginRight: 4 }} />
                       ))}
                     </View>
                   </View>
@@ -5673,35 +6256,38 @@ export default function App() {
               {/* Metrics Grid */}
               <View style={{ flexDirection: 'row', gap: 12, marginBottom: 32 }}>
                 <View style={{ flex: 1, backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
-                  <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 4 }}>Acceptance</Text>
-                  <Text style={{ color: '#1F2937', fontSize: 24, fontWeight: '700' }}>85%</Text>
+                  <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 4 }}>Jobs Done</Text>
+                  <Text style={{ color: '#1F2937', fontSize: 24, fontWeight: '700' }}>{collectorMetric?.completed_jobs ?? '—'}</Text>
                 </View>
                 <View style={{ flex: 1, backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
                   <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 4 }}>Completion</Text>
-                  <Text style={{ color: '#1F2937', fontSize: 24, fontWeight: '700' }}>98%</Text>
+                  <Text style={{ color: '#1F2937', fontSize: 24, fontWeight: '700' }}>
+                    {collectorMetric?.completion_rate !== undefined ? `${Math.round(collectorMetric.completion_rate)}%` : '—'}
+                  </Text>
                 </View>
                 <View style={{ flex: 1, backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
-                  <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 4 }}>Cancel</Text>
-                  <Text style={{ color: '#06C167', fontSize: 24, fontWeight: '700' }}>1%</Text>
+                  <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 4 }}>Cancelled</Text>
+                  <Text style={{ color: '#06C167', fontSize: 24, fontWeight: '700' }}>
+                    {collectorMetric?.completion_rate !== undefined ? `${Math.round(100 - collectorMetric.completion_rate)}%` : '—'}
+                  </Text>
                 </View>
               </View>
 
               {/* Recent Feedback */}
               <Text style={styles.sectionHeader}>Recent Feedback</Text>
               <View style={{ gap: 16 }}>
-                {[
-                  { comment: 'Very fast and polite!', rating: 5, time: '2h ago' },
-                  { comment: 'Great service, collected everything.', rating: 5, time: 'Yesterday' },
-                  { comment: 'Arrived a bit late but good job.', rating: 4, time: '2 days ago' },
-                ].map((fb, i) => (
+                {collectorReviews.length === 0 && (
+                  <Text style={{ color: '#9CA3AF', fontSize: 14, textAlign: 'center', paddingVertical: 20 }}>No reviews yet.</Text>
+                )}
+                {collectorReviews.map((fb, i) => (
                   <View key={i} style={{ backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6' }}>
                     <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 8 }}>
                       <View style={{ flexDirection: 'row' }}>
-                        {[...Array(fb.rating)].map((_, s) => (
+                        {[...Array(fb.rating || 0)].map((_, s) => (
                           <Star key={s} size={14} color="#F59E0B" fill="#F59E0B" style={{ marginRight: 2 }} />
                         ))}
                       </View>
-                      <Text style={{ color: '#9CA3AF', fontSize: 12 }}>{fb.time}</Text>
+                      <Text style={{ color: '#9CA3AF', fontSize: 12 }}>{fb.created_at ? new Date(fb.created_at).toLocaleDateString() : ''}</Text>
                     </View>
                     <Text style={{ color: '#374151', fontSize: 14, fontStyle: 'italic' }}>&quot;{fb.comment}&quot;</Text>
                   </View>
@@ -5947,30 +6533,38 @@ export default function App() {
                 <ChevronLeft size={24} color="#fff" />
               </TouchableOpacity>
               <Text style={[styles.headerTitle, { color: '#fff' }]}>Schedule</Text>
-              <View style={{ flexDirection: 'row', gap: 16 }}>
-                <TouchableOpacity accessibilityLabel="Calendar View">
-                  <Calendar size={20} color="#fff" />
-                </TouchableOpacity>
-                <TouchableOpacity accessibilityLabel="List View">
-                  <Text style={{ color: '#06C167', fontWeight: '700' }}>List</Text>
-                </TouchableOpacity>
-              </View>
+              <View style={{ width: 40 }} />
             </View>
 
             <ScrollView contentContainerStyle={{ padding: 20 }}>
-              {/* Date Selector (Horizontal Scroll) */}
+              {/* Date Selector — used to be 5 hardcoded fake dates ("Wed 21"
+                  etc.) with no onPress at all, and the list below showed
+                  every pending job regardless of what was "selected". Now
+                  real consecutive dates starting today, and the list below
+                  actually filters by the selected day. */}
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 24 }}>
-                {[{ d: '21', day: 'Wed', active: true }, { d: '22', day: 'Thu' }, { d: '23', day: 'Fri' }, { d: '24', day: 'Sat' }, { d: '25', day: 'Sun' }].map((date, i) => (
-                  <TouchableOpacity key={i} style={{ alignItems: 'center', marginRight: 16, backgroundColor: date.active ? '#06C167' : '#fff', paddingVertical: 12, paddingHorizontal: 16, borderRadius: 16, borderWidth: 1, borderColor: date.active ? '#06C167' : '#E5E7EB' }}>
-                    <Text style={{ fontSize: 12, color: date.active ? '#fff' : '#6B7280', marginBottom: 4 }}>{date.day}</Text>
-                    <Text style={{ fontSize: 18, fontWeight: '700', color: date.active ? '#fff' : '#1F2937' }}>{date.d}</Text>
-                  </TouchableOpacity>
-                ))}
+                {Array.from({ length: 5 }, (_, i) => {
+                  const d = new Date();
+                  d.setDate(d.getDate() + i);
+                  const active = d.toDateString() === selectedScheduleDate.toDateString();
+                  return (
+                    <TouchableOpacity
+                      key={i}
+                      onPress={() => setSelectedScheduleDate(d)}
+                      style={{ alignItems: 'center', marginRight: 16, backgroundColor: active ? '#06C167' : '#fff', paddingVertical: 12, paddingHorizontal: 16, borderRadius: 16, borderWidth: 1, borderColor: active ? '#06C167' : '#E5E7EB' }}
+                    >
+                      <Text style={{ fontSize: 12, color: active ? '#fff' : '#6B7280', marginBottom: 4 }}>{d.toLocaleDateString('en-US', { weekday: 'short' })}</Text>
+                      <Text style={{ fontSize: 18, fontWeight: '700', color: active ? '#fff' : '#1F2937' }}>{d.getDate()}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
               </ScrollView>
 
-              <Text style={styles.sectionHeader}>Upcoming Jobs</Text>
+              <Text style={styles.sectionHeader}>
+                {selectedScheduleDate.toDateString() === new Date().toDateString() ? "Today's Jobs" : `Jobs on ${selectedScheduleDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`}
+              </Text>
               <View style={{ gap: 16 }}>
-                {pendingPickups.length > 0 ? pendingPickups.map((pickup, index) => (
+                {pendingPickups.filter(p => new Date(p.created_at).toDateString() === selectedScheduleDate.toDateString()).length > 0 ? pendingPickups.filter(p => new Date(p.created_at).toDateString() === selectedScheduleDate.toDateString()).map((pickup, index) => (
                   <View key={pickup.id || index} style={{ backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 1, borderColor: '#F3F4F6', flexDirection: 'row' }}>
                     <View style={{ marginRight: 16, alignItems: 'center' }}>
                       <Text style={{ fontSize: 14, fontWeight: '700', color: '#1F2937' }}>
@@ -6001,46 +6595,85 @@ export default function App() {
                         >
                           Accept
                         </Button>
-                        <Button variant="outline" style={{ flex: 1, height: 'auto', paddingVertical: 8 }} onPress={() => alert('Declined')}>Decline</Button>
+                        <Button
+                          variant="outline"
+                          style={{ flex: 1, height: 'auto', paddingVertical: 8 }}
+                          onPress={() => {
+                            // This used to just show alert('Declined') and do
+                            // nothing else — the job stayed pending and kept
+                            // reappearing here and on the Dashboard forever.
+                            // Matches the real dismiss behavior used
+                            // elsewhere: hide it from this collector only
+                            // (it's a broadcast request — another collector
+                            // can still accept it), not cancel it outright.
+                            setDismissedRequestIds(prev => [...prev, pickup.id]);
+                            setPendingPickups(prev => prev.filter(req => req.id !== pickup.id));
+                          }}
+                        >
+                          Decline
+                        </Button>
                       </View>
                     </View>
                   </View>
                 )) : (
                   <View style={{ padding: 40, alignItems: 'center', backgroundColor: '#F9FAFB', borderRadius: 16, borderStyle: 'dashed', borderWidth: 1, borderColor: '#D1D5DB' }}>
-                    <Text style={{ color: '#9CA3AF', fontSize: 14 }}>No pending jobs for today</Text>
+                    <Text style={{ color: '#9CA3AF', fontSize: 14 }}>
+                      {selectedScheduleDate.toDateString() === new Date().toDateString() ? 'No pending jobs for today' : 'No pending jobs on this day'}
+                    </Text>
                   </View>
                 )}
               </View>
 
 
-              {/* Recurring Routes Section */}
+              {/* Recurring Routes Section — used to be one hardcoded card
+                  ("Kasoa Sector 4", fake earnings) that never changed.
+                  subscriptions is the real table customers create recurring
+                  pickup schedules in — surfaced here as discoverable
+                  recurring work, matching the existing "+ Find Routes" label. */}
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 32, marginBottom: 16 }}>
                 <Text style={styles.sectionHeader}>My Recurring Routes</Text>
-                <TouchableOpacity>
+                <TouchableOpacity onPress={fetchRecurringRoutes}>
                   <Text style={{ color: '#06C167', fontWeight: '700' }}>+ Find Routes</Text>
                 </TouchableOpacity>
               </View>
 
               <View style={{ gap: 16, marginBottom: 40 }}>
-                <View style={{ backgroundColor: '#111', padding: 16, borderRadius: 16 }}>
-                  <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 }}>
-                    <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>Kasoa Sector 4</Text>
-                    <View style={{ backgroundColor: '#06C167', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 }}>
-                      <Text style={{ fontSize: 10, color: '#fff', fontWeight: '700' }}>ACTIVE</Text>
+                {isLoadingRecurringRoutes ? (
+                  <ActivityIndicator color="#06C167" />
+                ) : recurringRoutes.length > 0 ? recurringRoutes.map((route) => (
+                  <View key={route.id} style={{ backgroundColor: '#111', padding: 16, borderRadius: 16 }}>
+                    <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 }}>
+                      <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>{route.collection_address || 'Recurring Pickup'}</Text>
+                      <View style={{ backgroundColor: '#06C167', paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 }}>
+                        <Text style={{ fontSize: 10, color: '#fff', fontWeight: '700' }}>{(route.status || 'active').toUpperCase()}</Text>
+                      </View>
                     </View>
+                    <View style={{ flexDirection: 'row', gap: 24, marginBottom: 16 }}>
+                      <View>
+                        <Text style={{ color: '#9CA3AF', fontSize: 12 }}>Frequency</Text>
+                        <Text style={{ color: '#fff', fontWeight: '600' }}>{route.frequency ? `${route.frequency} (${route.day_of_week || '—'})` : '—'}</Text>
+                      </View>
+                      <View>
+                        <Text style={{ color: '#9CA3AF', fontSize: 12 }}>Time Window</Text>
+                        <Text style={{ color: '#fff', fontWeight: '600' }}>{route.time_window || '—'}</Text>
+                      </View>
+                    </View>
+                    <Button
+                      variant="outline"
+                      style={{ height: 36, borderColor: '#374151' }}
+                      onPress={() => Alert.alert(
+                        route.collection_address || 'Recurring Route',
+                        `Frequency: ${route.frequency || '—'}\nDay: ${route.day_of_week || '—'}\nTime window: ${route.time_window || '—'}\nBilling: ${route.billing_preference || '—'}`
+                      )}
+                    >
+                      View Route Details
+                    </Button>
                   </View>
-                  <View style={{ flexDirection: 'row', gap: 24, marginBottom: 16 }}>
-                    <View>
-                      <Text style={{ color: '#9CA3AF', fontSize: 12 }}>Frequency</Text>
-                      <Text style={{ color: '#fff', fontWeight: '600' }}>Weekly (Mon)</Text>
-                    </View>
-                    <View>
-                      <Text style={{ color: '#9CA3AF', fontSize: 12 }}>Est. Earnings</Text>
-                      <Text style={{ color: '#fff', fontWeight: '600' }}>GH₵ 450/mo</Text>
-                    </View>
+                )) : (
+                  <View style={{ padding: 40, alignItems: 'center', backgroundColor: '#F9FAFB', borderRadius: 16, borderStyle: 'dashed', borderWidth: 1, borderColor: '#D1D5DB' }}>
+                    <Text style={{ color: '#9CA3AF', fontSize: 14, textAlign: 'center' }}>No active recurring pickup schedules right now.{'\n'}Tap &quot;+ Find Routes&quot; to check again.</Text>
                   </View>
-                  <Button variant="outline" style={{ height: 36, borderColor: '#374151' }} onPress={() => alert('Route Details')}>View Route Details</Button>
-                </View>
+                )}
               </View>
             </ScrollView>
           </View>
@@ -6183,15 +6816,22 @@ export default function App() {
                     event: 'sos_emergency',
                     payload: { collector_id: user?.id, full_name: userProfile?.full_name, phone: userProfile?.phone_number, timestamp: new Date().toISOString() }
                   });
-                  // Also insert an incident report so it persists on the admin dashboard
-                  await supabase.from('incident_reports').insert({
+                  // Also insert an incident report so it persists on the admin dashboard.
+                  // This was silently failing on every single SOS press —
+                  // incident_reports has no "severity" column (it's called
+                  // "priority"), so PostgREST rejected every one of these
+                  // inserts with a 400. The broadcast above still reached an
+                  // admin who happened to be online that exact moment, but
+                  // the emergency itself was never actually saved anywhere.
+                  const { error: sosInsertError } = await supabase.from('incident_reports').insert({
                     collector_id: user?.id || 'anon',
                     pickup_id: activePickup?.id || null,
                     type: 'SAFETY_THREAT',
                     description: 'SOS EMERGENCY ACTIVATED by Collector',
-                    severity: 'CRITICAL',
-                    status: 'INVESTIGATING'
+                    priority: 'CRITICAL',
+                    status: 'PENDING'
                   });
+                  if (sosInsertError) console.error('[SOS] Failed to persist incident report:', sosInsertError);
                   
                   Alert.alert(
                     'SOS Emergency Activated 🚨',
@@ -6221,22 +6861,28 @@ export default function App() {
                       </Text>
                     </View>
                   </View>
-                  <TouchableOpacity 
+                  <TouchableOpacity
+                    disabled={isConvoyActionLoading}
                     onPress={() => {
-                      const newState = !convoyActive;
-                      setConvoyActive(newState);
-                      // Broadcast convoy mode toggle to admin
+                      // This used to only flip a local boolean and send a
+                      // broadcast to the admin console — it never actually
+                      // created or joined a real convoy (convoys/
+                      // convoy_members), even though the copy claimed "you
+                      // are now linked with nearby collectors." Now calls
+                      // the same real functions the dedicated Convoy Mode
+                      // screen uses, so both entry points share one real,
+                      // DB-backed convoy membership instead of two
+                      // disconnected concepts.
                       supabase.channel('admin_global_alerts').send({
                         type: 'broadcast',
                         event: 'convoy_mode',
-                        payload: { collector_id: user?.id, full_name: userProfile?.full_name, active: newState, timestamp: new Date().toISOString() }
+                        payload: { collector_id: user?.id, full_name: userProfile?.full_name, active: !convoyActive, timestamp: new Date().toISOString() }
                       });
-                      Alert.alert(
-                        'Convoy Mode ' + (newState ? 'Activated 🛡️' : 'Deactivated'),
-                        newState 
-                          ? 'You are now securely linked with nearby active Borla collectors for night-time area escort and real-time mutual location tracking.'
-                          : 'Convoy Mode has been deactivated.'
-                      );
+                      if (convoyActive) {
+                        handleLeaveConvoy(false);
+                      } else {
+                        handleStartConvoy();
+                      }
                     }}
                     style={{ width: 50, height: 28, borderRadius: 14, backgroundColor: convoyActive ? '#10B981' : '#D1D5DB', justifyContent: 'center', padding: 2 }}
                   >
@@ -6372,15 +7018,20 @@ export default function App() {
                         }
                       });
 
-                      // 2. Insert into database if online
-                      await supabase.from('incident_reports').insert({
+                      // 2. Insert into database if online.
+                      // Same bug as the SOS button — "severity" isn't a real
+                      // column on incident_reports ("priority" is), so this
+                      // insert was rejected every time and no report was
+                      // ever actually saved, despite the success alert below.
+                      const { error: incidentInsertError } = await supabase.from('incident_reports').insert({
                         collector_id: user?.id || 'anon',
                         pickup_id: activePickup?.id || null,
                         type: inc.type,
                         description: inc.desc,
-                        severity: inc.type === 'ACCIDENT' || inc.type === 'SAFETY_THREAT' ? 'CRITICAL' : 'MAJOR',
-                        status: 'INVESTIGATING'
+                        priority: inc.type === 'ACCIDENT' || inc.type === 'SAFETY_THREAT' ? 'CRITICAL' : 'URGENT',
+                        status: 'PENDING'
                       });
+                      if (incidentInsertError) console.error('[Incident] Failed to persist report:', incidentInsertError);
 
                       Alert.alert(
                         'Incident Reported ✅', 
@@ -6559,7 +7210,7 @@ export default function App() {
                     alert('Please fill all required fields (*)');
                     return;
                   }
-                  setIsLoading(true);
+                  setIsSavingVehicleDetails(true);
                   const { error } = await supabase.from('profiles').update({
                     vehicle_type: vehicleDetails.type,
                     vehicle_number: vehicleDetails.plate,
@@ -6571,13 +7222,14 @@ export default function App() {
                     },
                     updated_at: new Date().toISOString(),
                   }).eq('id', user?.id);
-                  setIsLoading(false);
+                  setIsSavingVehicleDetails(false);
                   if (error) {
                     alert('Could not save vehicle details: ' + error.message);
                     return;
                   }
                   setStep(AppStep.COLLECTOR_DOCUMENT_UPLOAD);
                 }}
+                isLoading={isSavingVehicleDetails}
                 style={{ marginTop: 40 }}
               >
                 Continue to Documents
@@ -6656,12 +7308,12 @@ export default function App() {
                     alert('Please upload all required documents (*)');
                     return;
                   }
-                  setIsLoading(true);
+                  setIsSubmittingDocuments(true);
                   const { error } = await supabase.from('profiles').update({
                     onboarding_completed: true,
                     updated_at: new Date().toISOString()
                   }).eq('id', user?.id);
-                  
+
                   if (!error) {
                     setUserProfile((prev: any) => ({ ...prev, onboarding_completed: true }));
                     setApprovalStatus('pending');
@@ -6669,8 +7321,9 @@ export default function App() {
                   } else {
                     alert('Error saving status: ' + error.message);
                   }
-                  setIsLoading(false);
+                  setIsSubmittingDocuments(false);
                 }}
+                isLoading={isSubmittingDocuments}
                 style={{ marginTop: 40 }}
               >
                 Submit for Approval
@@ -6779,15 +7432,15 @@ export default function App() {
                     Alert.alert('Required', 'Please take a photo of the cleaned area.');
                     return;
                   }
-                  setIsLoading(true);
+                  setIsSubmittingProof(true);
                   try {
                     const proofUrl = await uploadToSupabase(proofPhoto, 'proof-of-clean', `proofs/${activePickup.id}.jpg`);
-                    
+
                     const { error } = await supabase
                       .from('pickups')
-                      .update({ 
+                      .update({
                         status: 'collected',
-                        proof_url: proofUrl 
+                        proof_url: proofUrl
                       })
                       .eq('id', activePickup.id);
 
@@ -6802,34 +7455,34 @@ export default function App() {
                   } catch (e: any) {
                     Alert.alert('Error', 'Failed to upload proof: ' + e.message);
                   } finally {
-                    setIsLoading(false);
+                    setIsSubmittingProof(false);
                   }
                 }}
-                isLoading={isLoading}
+                isLoading={isSubmittingProof}
                 disabled={!proofPhoto}
                 style={{ backgroundColor: proofPhoto ? '#06C167' : '#9CA3AF' }}
               >
                 Submit Proof & Complete
               </Button>
 
-              <TouchableOpacity 
+              <TouchableOpacity
                 onPress={() => {
                   Alert.alert(
                     'Skip Proof of Clean?',
                     'Only skip if the customer is present or requested no photo. Are you sure you want to proceed?',
                     [
                       { text: 'Cancel', style: 'cancel' },
-                      { 
-                        text: 'Skip & Complete', 
-                        style: 'destructive', 
+                      {
+                        text: 'Skip & Complete',
+                        style: 'destructive',
                         onPress: async () => {
-                          setIsLoading(true);
+                          setIsSubmittingProof(true);
                           const { error } = await supabase
                             .from('pickups')
                             .update({ status: 'collected' })
                             .eq('id', activePickup.id);
-                          
-                          setIsLoading(false);
+
+                          setIsSubmittingProof(false);
                           if (!error) {
                             setJobStatus('collected');
                             setStep(AppStep.COLLECTOR_JOB);
@@ -6837,12 +7490,12 @@ export default function App() {
                           } else {
                             Alert.alert('Error', 'Failed to update job status: ' + error.message);
                           }
-                        } 
+                        }
                       }
                     ]
                   );
                 }}
-                disabled={isLoading}
+                disabled={isSubmittingProof}
                 style={{ padding: 16, alignItems: 'center', borderRadius: 12, backgroundColor: '#F3F4F6' }}
               >
                 <Text style={{ color: '#6B7280', fontWeight: '700', fontSize: 16 }}>Complete Without Photo</Text>
@@ -6865,7 +7518,7 @@ export default function App() {
                     const result = await analyzeTrashImage(base64);
                     setAiResult(result);
                   } catch (err: any) {
-                    console.error('Gemini error:', err);
+                    console.error('AI estimator error:', err);
                     setAiError('Could not analyze the image. Please try again.');
                   } finally {
                     setIsAnalyzing(false);
@@ -6886,7 +7539,7 @@ export default function App() {
                       <View style={{ alignItems: 'center', paddingVertical: 24 }}>
                         <ActivityIndicator size="large" color="#06C167" style={{ marginBottom: 16 }} />
                         <Text style={{ fontSize: 18, fontWeight: '700', color: '#1F2937' }}>Analyzing Trash...</Text>
-                        <Text style={{ color: '#6B7280', marginTop: 4 }}>Gemini AI is estimating volume & price</Text>
+                        <Text style={{ color: '#6B7280', marginTop: 4 }}>AI is estimating volume & price</Text>
                       </View>
                     ) : aiError ? (
                       <View style={{ alignItems: 'center', paddingVertical: 20 }}>
@@ -6905,9 +7558,9 @@ export default function App() {
 
                         <View style={{ flexDirection: 'row', gap: 10, marginBottom: 20 }}>
                           <View style={{ padding: 12, backgroundColor: '#F3F4F6', borderRadius: 12, flex: 1 }}>
-                            <Text style={{ fontSize: 10, color: '#6B7280', fontWeight: '700' }}>BINS</Text>
-                            <Text style={{ fontSize: 18, fontWeight: '800', color: '#1F2937' }}>{aiResult.binCount}x</Text>
-                            <Text style={{ fontSize: 10, color: '#9CA3AF' }}>240L bins</Text>
+                            <Text style={{ fontSize: 10, color: '#6B7280', fontWeight: '700' }}>VOLUME</Text>
+                            <Text style={{ fontSize: 18, fontWeight: '800', color: '#1F2937' }}>{aiResult.binCount.toFixed(2)}</Text>
+                            <Text style={{ fontSize: 10, color: '#9CA3AF' }}>standard bins</Text>
                           </View>
                           <View style={{ padding: 12, backgroundColor: '#F3F4F6', borderRadius: 12, flex: 1 }}>
                             <Text style={{ fontSize: 10, color: '#6B7280', fontWeight: '700' }}>EST. WEIGHT</Text>
@@ -6921,8 +7574,8 @@ export default function App() {
 
                         <View style={{ backgroundColor: '#F0FDF4', borderRadius: 16, padding: 16, marginBottom: 20, alignItems: 'center' }}>
                           <Text style={{ fontSize: 12, color: '#166534', fontWeight: '700', letterSpacing: 1 }}>ESTIMATED PRICE</Text>
-                          <Text style={{ fontSize: 36, fontWeight: '900', color: '#06C167' }}>GH₵ {aiResult.priceLow}–{aiResult.priceHigh}</Text>
-                          <Text style={{ fontSize: 12, color: '#6B7280' }}>Based on GH₵ 30 per standard 240L bin</Text>
+                          <Text style={{ fontSize: 36, fontWeight: '900', color: '#06C167' }}>GH₵ {aiResult.price}</Text>
+                          <Text style={{ fontSize: 12, color: '#6B7280' }}>Based on GH₵ 40 per standard wheeled bin • {aiResult.confidence}% confidence</Text>
                         </View>
 
                         <Button onPress={async () => {
@@ -6931,7 +7584,7 @@ export default function App() {
                             return;
                           }
                           
-                          setIsLoading(true);
+                          setIsBookingFromEstimate(true);
                           try {
                             const rawCollectors = await findNearbyCollectors(userCoords.latitude, userCoords.longitude, COVERAGE_RADIUS_MILES);
                             const freshCollectors = rawCollectors.filter(c => isLocationFresh(c.updated_at));
@@ -6939,7 +7592,7 @@ export default function App() {
 
                             if (freshCollectors.length === 0) {
                               Alert.alert(
-                                "No Collectors Nearby", 
+                                "No Collectors Nearby",
                                 "We couldn't find any collectors online in your area right now. Please try again in a few minutes.",
                                 [{ text: "OK" }]
                               );
@@ -6947,19 +7600,19 @@ export default function App() {
                             }
 
                             if (aiResult) {
-                              setSplitAmount(aiResult.priceHigh);
+                              setSplitAmount(aiResult.price);
                               setSelectedTrashType(aiResult.trashType as TrashType);
                               if (aiResult.recommendedVehicle === 'Tricycle') setSelectedVehicle(TRASH_VEHICLES[0]);
                               else if (aiResult.recommendedVehicle === 'Mini Truck') setSelectedVehicle(TRASH_VEHICLES[1]);
-                              else if (aiResult.recommendedVehicle === 'Pickup') setSelectedVehicle(TRASH_VEHICLES[1]); 
+                              else if (aiResult.recommendedVehicle === 'Pickup') setSelectedVehicle(TRASH_VEHICLES[1]);
                             }
                             setStep(AppStep.BOOKING);
                           } catch (e) {
                             Alert.alert("Error", "Could not verify collector availability. Please try again.");
                           } finally {
-                            setIsLoading(false);
+                            setIsBookingFromEstimate(false);
                           }
-                        }}>Book This Pickup</Button>
+                        }} isLoading={isBookingFromEstimate}>Book This Pickup</Button>
                         <Button variant="outline" onPress={() => { setCapturedImage(null); setAiResult(null); }} style={{ marginTop: 12 }}>Retake Photo</Button>
                       </>
                     ) : null}
@@ -7007,26 +7660,22 @@ export default function App() {
                       return;
                     }
                     setIsCreatingPool(true);
-                    let poolInsertData: any = { location_name: newPoolName.trim(), target_size: 5, status: 'OPEN', created_by: user?.id };
-                    let { data: pool, error } = await supabase
+                    // Real community_pools columns are `name` / `target_members` /
+                    // `current_members` (confirmed via a live schema dump) — this
+                    // used to insert `location_name` / `target_size`, columns that
+                    // don't exist, so every "Create Pool" attempt failed outright.
+                    const poolInsertData = {
+                      name: newPoolName.trim(),
+                      target_members: 5,
+                      current_members: 1,
+                      status: 'OPEN',
+                      created_by: user?.id,
+                    };
+                    const { data: pool, error } = await supabase
                       .from('community_pools')
                       .insert(poolInsertData)
                       .select()
                       .single();
-                    
-                    if (error && error.message.includes('column')) {
-                      // Fallback if the table specifically expects current_members or member_count
-                      if (error.message.includes('current_members')) {
-                        poolInsertData.current_members = 1;
-                      } else if (error.message.includes('member_count')) {
-                        poolInsertData.member_count = 1;
-                      } else if (error.message.includes('members_count')) {
-                        poolInsertData.members_count = 1;
-                      }
-                      const res = await supabase.from('community_pools').insert(poolInsertData).select().single();
-                      pool = res.data;
-                      error = res.error;
-                    }
 
                     if (error || !pool) {
                       Alert.alert('Error', 'Could not create pool: ' + (error?.message || 'Unknown error'));
@@ -7037,7 +7686,7 @@ export default function App() {
                     await supabase.from('community_pool_members').insert({ pool_id: pool.id, profile_id: user?.id });
                     setNewPoolName('');
                     setIsCreatingPool(false);
-                    Alert.alert('Pool Created! 🎉', `"${pool.location_name}" is live. Share it with your neighbors so they can join!`);
+                    Alert.alert('Pool Created! 🎉', `"${pool.name}" is live. Share it with your neighbors so they can join!`);
                     fetchCommunityPools();
                   }}
                   style={{ opacity: isCreatingPool ? 0.6 : 1 }}
@@ -7051,32 +7700,26 @@ export default function App() {
               {communityPools.length > 0 ? communityPools.map(pool => (
                 <View key={pool.id} style={{ backgroundColor: '#fff', padding: 16, borderRadius: 16, borderWidth: 2, borderColor: '#06C167', marginBottom: 16 }}>
                   <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <Text style={{ fontSize: 16, fontWeight: '700', color: '#1F2937' }}>{pool.location_name}</Text>
-                    <Text style={{ color: '#06C167', fontWeight: '800' }}>{pool.current_size}/{pool.target_size} Joined</Text>
+                    <Text style={{ fontSize: 16, fontWeight: '700', color: '#1F2937' }}>{pool.name}</Text>
+                    <Text style={{ color: '#06C167', fontWeight: '800' }}>{pool.current_size}/{pool.target_members} Joined</Text>
                   </View>
                   {pool.created_by === user?.id && (
                     <Text style={{ fontSize: 11, color: '#059669', fontWeight: '700', marginBottom: 6 }}>⭐ You created this pool</Text>
                   )}
                   <View style={{ height: 8, backgroundColor: '#E5E7EB', borderRadius: 4, marginBottom: 12 }}>
-                    <View style={{ width: `${Math.min((pool.current_size / pool.target_size) * 100, 100)}%`, height: '100%', backgroundColor: '#06C167', borderRadius: 4 }} />
+                    <View style={{ width: `${Math.min((pool.current_size / pool.target_members) * 100, 100)}%`, height: '100%', backgroundColor: '#06C167', borderRadius: 4 }} />
                   </View>
                   <Text style={{ color: '#6B7280', fontSize: 12, marginBottom: 16 }}>
-                    {pool.current_size >= pool.target_size
+                    {pool.current_size >= pool.target_members
                       ? '✅ Pool is full! A collector will be dispatched.'
-                      : `${pool.target_size - pool.current_size} more neighbor(s) needed for the group discount.`}
+                      : `${pool.target_members - pool.current_size} more neighbor(s) needed for the group discount.`}
                   </Text>
                   <Button onPress={async () => {
                     const { error } = await supabase.from('community_pool_members').insert({ pool_id: pool.id, profile_id: user?.id });
                     if (error) {
                       Alert.alert('Already Joined', 'You are already a member of this pool.');
                     } else {
-                      if (pool.current_members !== undefined) {
-                        await supabase.from('community_pools').update({ current_members: pool.current_members + 1 }).eq('id', pool.id);
-                      } else if (pool.member_count !== undefined) {
-                        await supabase.from('community_pools').update({ member_count: pool.member_count + 1 }).eq('id', pool.id);
-                      } else if (pool.members_count !== undefined) {
-                        await supabase.from('community_pools').update({ members_count: pool.members_count + 1 }).eq('id', pool.id);
-                      }
+                      await supabase.from('community_pools').update({ current_members: (pool.current_members || 0) + 1 }).eq('id', pool.id);
                       Alert.alert('Welcome! 🎉', 'You have joined the pool. You will be notified when it fills up.');
                       fetchCommunityPools();
                     }
@@ -7166,7 +7809,7 @@ export default function App() {
                     style={{ backgroundColor: '#F3F4F6', padding: 16, borderRadius: 12, fontSize: 18, fontWeight: '700', marginBottom: 24 }}
                   />
 
-                  <Button onPress={handleWithdraw} isLoading={isLoading}>
+                  <Button onPress={handleWithdraw} isLoading={isWithdrawing}>
                     <Text style={{ color: '#fff', fontWeight: '800' }}>Submit Request</Text>
                   </Button>
                 </View>
@@ -7193,10 +7836,14 @@ export default function App() {
               />
               <View style={[styles.historyHeader, { position: 'absolute', top: 50, borderBottomWidth: 0, paddingHorizontal: 20, width: '100%' }]}>
                 <TouchableOpacity onPress={back} style={styles.roundBtn}><ChevronLeft size={24} color="#000" /></TouchableOpacity>
-                <View style={{ backgroundColor: '#111', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, flexDirection: 'row', alignItems: 'center' }}>
-                  <Users size={16} color="#06C167" style={{ marginRight: 8 }} />
-                  <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>ACTIVE CONVOY: KASOA NORTH</Text>
-                </View>
+                {convoyActive && (
+                  <View style={{ backgroundColor: '#111', paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, flexDirection: 'row', alignItems: 'center' }}>
+                    <Users size={16} color="#06C167" style={{ marginRight: 8 }} />
+                    <Text style={{ color: '#fff', fontWeight: '800', fontSize: 12 }}>
+                      ACTIVE CONVOY: {(activeConvoyMembers.find(c => c.id === currentConvoyId)?.zone_name || locationLabel || 'Unknown Zone').toUpperCase()}
+                    </Text>
+                  </View>
+                )}
                 <View style={{ width: 40 }} />
               </View>
             </View>
@@ -7215,19 +7862,19 @@ export default function App() {
                     </View>
                   </View>
                   <Text style={{ color: '#6B7280', fontSize: 13, marginBottom: 16 }}>Members: {c.convoy_members?.length || 0} collectors nearby</Text>
-                  <Button onPress={() => handleJoinConvoy(c.id, c.zone_name)} isLoading={isLoading}>Join Group</Button>
+                  <Button onPress={() => handleJoinConvoy(c.id, c.zone_name)} isLoading={isConvoyActionLoading}>Join Group</Button>
                 </View>
               )) : (
                 <View style={{ padding: 40, alignItems: 'center' }}>
                   <Users size={48} color="#D1D5DB" />
                   <Text style={{ color: '#9CA3AF', marginTop: 12 }}>No active convoys in this zone</Text>
-                  <Button onPress={handleStartConvoy} isLoading={isLoading} style={{ marginTop: 20 }}>Start a Convoy</Button>
+                  <Button onPress={handleStartConvoy} isLoading={isConvoyActionLoading} style={{ marginTop: 20 }}>Start a Convoy</Button>
                 </View>
               )}
 
               <View style={{ position: 'absolute', bottom: 30, left: 24, right: 24, flexDirection: 'row', gap: 12 }}>
-                <Button onPress={handleInviteToConvoy} isLoading={isLoading} style={{ flex: 1 }}>Invite Near Me</Button>
-                <Button onPress={handleLeaveConvoy} isLoading={isLoading} variant="outline" style={{ flex: 1 }}>{convoyActive ? 'Leave Convoy' : 'Back'}</Button>
+                <Button onPress={handleInviteToConvoy} isLoading={isConvoyActionLoading} style={{ flex: 1 }}>Invite Near Me</Button>
+                <Button onPress={() => handleLeaveConvoy(true)} isLoading={isConvoyActionLoading} variant="outline" style={{ flex: 1 }}>{convoyActive ? 'Leave Convoy' : 'Back'}</Button>
               </View>
             </View>
           </View>
@@ -7264,8 +7911,8 @@ export default function App() {
                     <Text style={{ color: '#06C167', fontWeight: '700' }}>5% Instant Discount</Text>
                   </View>
                 </View>
-                <Text style={{ color: '#6B7280', fontSize: 13, marginBottom: 16 }}>Valid at all Kasoa and Accra branches. Show your Borla ID at the pump.</Text>
-                <Button onPress={() => Alert.alert('Discount Active', 'Please show the QR code to the GOIL attendant.')}>Activate Voucher</Button>
+                <Text style={{ color: '#6B7280', fontSize: 13, marginBottom: 16 }}>Valid at all Kasoa and Accra branches. Costs {GOIL_VOUCHER_POINTS_COST} points — show the code to the GOIL attendant.</Text>
+                <Button onPress={handleActivateFuelVoucher} isLoading={isRedeemingVoucher}>Activate Voucher ({GOIL_VOUCHER_POINTS_COST} pts)</Button>
               </TouchableOpacity>
 
               <TouchableOpacity style={{ backgroundColor: '#fff', padding: 20, borderRadius: 24, borderWidth: 1, borderColor: '#F3F4F6', marginBottom: 16 }}>
@@ -7322,11 +7969,12 @@ export default function App() {
           </View>
         )}
         {renderScreen()}
-        {isLoading && (
-          <View style={styles.globalLoading}>
-            <ActivityIndicator size="large" color="#06C167" />
-          </View>
-        )}
+        {/* The old root-level full-screen loading overlay (styles.globalLoading)
+            was removed here — it was driven by a single isLoading flag shared
+            across ~22 unrelated actions app-wide, so opening Profile, booking
+            a pickup, or any background fetch all froze the entire UI. Every
+            action now has its own dedicated, localized loading state instead
+            (see the isXxx flags declared near the top of this component). */}
 
         
         {/* Customer Rating Modal */}
@@ -7409,23 +8057,46 @@ export default function App() {
                     await supabase.from('profiles').update({ rating_average: selectedRating }).eq('id', ratingCollector.id);
                     // 2. Insert into reviews table for Admin Dashboard & full audit trail
                     const finalComment = ratingComment ? `${selectedRatingTag ? selectedRatingTag + ' - ' : ''}${ratingComment}` : selectedRatingTag || 'Great service';
-                    await supabase.from('reviews').insert({
+                    // reviewee_id is required (NOT NULL) by the live schema — it was
+                    // missing here, which meant this insert failed on every single
+                    // submission. The error was never checked, so it failed silently
+                    // and every review was only ever captured by the incident_reports
+                    // backup path below.
+                    // reviews.pickup_id is also NOT NULL — resetBookingStates()
+                    // (called from handlePaymentSuccess, right before this modal
+                    // opens) sets activePickup back to null, so activePickup?.id
+                    // was always null by the time this ran. ratingPickupId is
+                    // captured earlier, before that reset happens.
+                    const { error: reviewInsertError } = await supabase.from('reviews').insert({
                       reviewer_id: user?.id || ratingCollector.id, // fallback if anonymous
-                      pickup_id: activePickup?.id || null,
+                      reviewee_id: ratingCollector.id,
+                      pickup_id: ratingPickupId || activePickup?.id || null,
                       rating: selectedRating,
                       comment: finalComment,
                       is_flagged: selectedRating <= 2
                     });
+                    if (reviewInsertError) {
+                      console.error('[Rating] Failed to insert into reviews:', reviewInsertError);
+                    }
 
-                    // 2b. Backup insert into incident_reports to bypass strict RLS on reviews table
-                    await supabase.from('incident_reports').insert({
+                    // 2b. Backup insert into incident_reports to bypass strict RLS on reviews table.
+                    // This "backup" was never actually reliable — incident_reports
+                    // has no "severity" column ("priority" is the real one), so this
+                    // insert 400'd every time. It's read back on the admin side
+                    // (web-admin fetchPerformanceData) as inc.priority, not
+                    // inc.severity, for the same reason. type: 'REVIEW' rows are
+                    // filtered out of the Incidents tab (BC-014), so reusing
+                    // priority to hold the numeric rating here doesn't collide
+                    // with its CRITICAL/URGENT/NORMAL meaning on real incidents.
+                    const { error: reviewBackupError } = await supabase.from('incident_reports').insert({
                       collector_id: ratingCollector.id,
-                      pickup_id: activePickup?.id || null,
+                      pickup_id: ratingPickupId || activePickup?.id || null,
                       type: 'REVIEW',
                       description: finalComment,
-                      severity: selectedRating.toString(), // Store rating as severity
-                      status: selectedRating <= 2 ? 'INVESTIGATING' : 'RESOLVED'
+                      priority: selectedRating.toString(),
+                      status: selectedRating <= 2 ? 'PENDING' : 'RESOLVED'
                     });
+                    if (reviewBackupError) console.error('[Rating] Failed to insert incident_reports backup:', reviewBackupError);
 
                     // 3. Always broadcast to admin global alerts so Admin Dashboard updates instantly
                     const adminAlertChan = supabase.channel('admin_global_alerts');
@@ -7450,6 +8121,7 @@ export default function App() {
                     setShowRatingModal(false);
                     setRatingComment('');
                     setSelectedRatingTag('');
+                    setRatingPickupId(null);
                     Alert.alert('Thank You!', 'Your feedback helps keep Borla premium.');
                   }
                 }}
@@ -7459,11 +8131,12 @@ export default function App() {
                 <Text style={{ color: '#fff', fontWeight: '800', fontSize: 16 }}>{isSubmittingRating ? 'Submitting...' : 'Submit Rating'}</Text>
               </TouchableOpacity>
 
-              <TouchableOpacity 
+              <TouchableOpacity
                 onPress={() => {
                   setShowRatingModal(false);
                   setRatingComment('');
                   setSelectedRatingTag('');
+                  setRatingPickupId(null);
                 }}
                 style={{ padding: 16, marginTop: 12, alignItems: 'center' }}
               >
@@ -8862,15 +9535,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '900',
     color: '#06C167',
-  },
-
-
-  globalLoading: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'rgba(255,255,255,0.7)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    zIndex: 9999,
   },
   otpInputFull: {
     backgroundColor: '#F9FAFB',
