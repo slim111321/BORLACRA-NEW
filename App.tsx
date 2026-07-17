@@ -344,7 +344,7 @@ export default function App() {
       setLocationSearchResults([]);
       return;
     }
-    setIsSearchingLocation(true);
+    setIsSearchingLiveLocation(true);
     try {
       // Bias results toward Ghana for better local relevance; dedupe=1 avoids
       // near-identical duplicate rows for the same place.
@@ -358,7 +358,7 @@ export default function App() {
       console.error('Nominatim search error:', e);
       setLocationSearchResults([]);
     } finally {
-      setIsSearchingLocation(false);
+      setIsSearchingLiveLocation(false);
     }
   }, []);
 
@@ -510,7 +510,7 @@ export default function App() {
   // Nominatim live location search state
   const [locationSearchQuery, setLocationSearchQuery] = useState('');
   const [locationSearchResults, setLocationSearchResults] = useState<any[]>([]);
-  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
+  const [isSearchingLiveLocation, setIsSearchingLiveLocation] = useState(false);
   const locationSearchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<'paystack' | 'cash'>('paystack');
@@ -871,7 +871,7 @@ export default function App() {
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'pickups' },
-        (payload) => {
+        (payload: any) => {
           console.log('[Realtime] Payload:', payload.eventType, payload.new?.id, payload.new?.status);
           
           fetchHistory(true);
@@ -1323,6 +1323,12 @@ export default function App() {
     };
   }, [user?.id, role]);
 
+  const fetchSupportTickets = useCallback(async () => {
+    if (!user?.id) return;
+    const { data } = await supabase.from('support_tickets').select('*').eq('user_id', user.id).order('created_at', { ascending: false });
+    if (data) setSupportTickets(data);
+  }, [user?.id]);
+
   // Global Alerts & Chat Badge Listener (Broadcast-based for guaranteed delivery)
   useEffect(() => {
     if (!user?.id) return;
@@ -1773,11 +1779,7 @@ export default function App() {
     if (data) setActiveConvoyMembers(data);
   }, []);
 
-  const fetchSupportTickets = useCallback(async () => {
-    if (!user?.id) return;
-    const { data } = await supabase.from('support_tickets').select('*').eq('user_id', user.id).order('created_at', { ascending: false });
-    if (data) setSupportTickets(data);
-  }, [user?.id]);
+
 
   const fetchChallenges = useCallback(async () => {
     if (!user?.id) return;
@@ -2802,7 +2804,7 @@ export default function App() {
             .then(({ data: docs }) => {
               const docMap: any = { ...(vDetails?.kyc_docs || {}) };
               if (docs) {
-                docs.forEach(d => {
+                docs.forEach((d: any) => {
                   const type = d.doc_type || d.document_type || '';
                   const url = d.doc_url || d.document_url || '';
                   if (type && url) {
@@ -3459,7 +3461,7 @@ export default function App() {
                         returnKeyType="search"
                         clearButtonMode="while-editing"
                       />
-                      {isSearchingLocation && <ActivityIndicator size="small" color="#06C167" />}
+                      {isSearchingLiveLocation && <ActivityIndicator size="small" color="#06C167" />}
                     </View>
 
                     {/* Live Search Results Dropdown */}
@@ -5449,7 +5451,6 @@ export default function App() {
                     const cacheBustedUrl = `${url}?t=${Date.now()}`;
                     await supabase.from('profiles').update({ avatar_url: cacheBustedUrl }).eq('id', user?.id);
                     setUserProfile((prev: any) => ({ ...prev, avatar_url: cacheBustedUrl }));
-                    fetchUserData();
                   }
                 })}>
                   <Image 
@@ -5799,7 +5800,7 @@ export default function App() {
                   )}
                   {jobStatus === 'arrived' && proofImage && (
                     <TouchableOpacity
-                      onPress={handleCollectionComplete}
+                      onPress={() => handleCollectionComplete()}
                       disabled={isCollecting}
                       style={[styles.loginButton, { backgroundColor: '#F59E0B', marginBottom: 0 }]}
                     >
@@ -7645,7 +7646,7 @@ export default function App() {
               {/* Create a Pool Section */}
               <View style={{ backgroundColor: '#fff', borderRadius: 20, padding: 20, borderWidth: 2, borderColor: '#D1FAE5', marginBottom: 28 }}>
                 <Text style={{ fontSize: 16, fontWeight: '800', color: '#064E3B', marginBottom: 4 }}>Start a New Pool</Text>
-                <Text style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>Give it a name your neighbors will recognise (e.g. "East Legon Block C").</Text>
+                <Text style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>Give it a name your neighbors will recognise (e.g. &quot;East Legon Block C&quot;).</Text>
                 <TextInput
                   value={newPoolName}
                   onChangeText={setNewPoolName}
