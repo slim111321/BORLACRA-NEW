@@ -101,6 +101,97 @@ See `../SCHEMA_NOTES.md` for schema/RLS notes gathered from a real
   **Rollback**: `supabase/rollback/20260716120000_profile_preferred_payment_method_DOWN.sql`
   — drops the column; touches nothing else.
 
+- `20260718000000_pickup_payment_verification.sql` — BC-018: closes the gap
+  where a collector could tap "Complete Job & Get Paid" and be paid
+  regardless of whether the customer's card/MoMo charge ever actually
+  succeeded (handlePaymentSuccess only ever touched local React state, no DB
+  write-back). Adds `pickups.payment_method` / `payment_status`, a new
+  customer-owner UPDATE policy restricted by a trigger to only ever setting
+  `payment_method` (never `payment_status`, never any other column), and
+  extends the Paystack webhook (`supabase/functions/paystack-webhook`) to
+  set `payment_status='paid'` on verified `pickup_payment` charges — the one
+  write path a customer's own client can't forge, since it only runs after
+  a real HMAC-verified Paystack event under the service-role key.
+  `handleJobFinalize` (App.tsx) now re-fetches both columns live and refuses
+  to finalize a paystack-method job until `payment_status='paid'`. Cash jobs
+  are deliberately left ungated — no cryptographic way to verify cash
+  changed hands, so the collector's own completion remains the trust point,
+  same as before this migration. Tested against a local Postgres fixture
+  (customer sets payment_method ✅, customer blocked from setting
+  payment_status directly ✅, customer blocked from touching status/
+  collector_id/pricing_ghs ✅, free to switch payment_method pre-payment ✅,
+  locked after payment_status='paid' ✅, service-role webhook write
+  unaffected by the customer restriction ✅) before being applied to the
+  live `samasama` project via `supabase db push`, and the updated edge
+  function deployed via `supabase functions deploy paystack-webhook`.
+
+  **Rollback**: `supabase/rollback/20260718000000_pickup_payment_verification_DOWN.sql`
+  — drops the trigger, function, policy, and both new columns.
+
+- `20260718010000_pickups_tighten_claim_policy.sql` — BC-019: while testing
+  BC-018 locally against the *real* pickups policies (pulled via a live
+  `supabase db dump --schema public`, confirming the exact definitions
+  SCHEMA_NOTES.md had only described), reproduced a real, live exploit: an
+  authenticated user with no relationship to a pickup at all (not its
+  customer, not its collector) could update that pickup's `payment_method`
+  — and, separately, any authenticated user with `role='COLLECTOR'` could
+  claim any pending pickup with **no `is_verified`/`onboarding_completed`
+  check**, via two redundant, overly-loose UPDATE policies ("Collectors can
+  claim and update pickups" and "pickups_update"). The BC-003 trigger
+  already independently blocked the unverified-collector-*assignment* case,
+  but the loose policies still undermined BC-018's payment gate. Could not
+  simply drop both policies — the one correctly-scoped policy
+  (`pickups_update_collector_ops`) only covers a pickup a collector is
+  *already* assigned to, not the initial claim of a still-pending one, so
+  dropping both would have broken the core "accept a job" flow entirely.
+  Instead, consolidated the two into one policy using the same
+  `is_verified_collector()`/`is_admin()` helpers the tight policy already
+  uses. Tested against a local fixture mirroring the exact real enum,
+  functions, and all five real pickups UPDATE/SELECT/INSERT policies:
+  verified collector claims a pending pickup ✅, unverified collector
+  blocked ✅, unrelated user blocked from touching someone else's pickup ✅
+  (previously reproduced as succeeding, confirmed fixed), admin override
+  still works ✅, customer's own BC-018 payment_method write unaffected ✅.
+  **Applied to the live `samasama` project** via `supabase db push`,
+  confirmed live via a post-push `supabase db dump` showing the loose
+  policy gone and the tightened one in place.
+
+  **Rollback**: `supabase/rollback/20260718010000_pickups_tighten_claim_policy_DOWN.sql`
+  — restores the original two loose policies exactly as they were live.
+
+- `20260718020000_security_definer_hardening.sql` — BC-020: found while
+  verifying admin-table RLS (BC-018/BC-019 follow-up). Live schema dump
+  revealed `process_payout(p_request_id)` — the RPC the admin console calls
+  to pay out a collector's cash-out request — had **no authorization check
+  at all** and was granted to `anon`: any caller, even fully
+  unauthenticated, could call it directly and force any payout to
+  'PAID' plus deduct the collector's wallet balance, with no idempotency
+  guard (callable twice on the same request for a double deduction). Also
+  found: `handle_pickup_completion()`, the actual trigger that pays a
+  collector the moment `pickups.status` becomes `'completed'`, had no
+  awareness of BC-018's new `payment_method`/`payment_status` columns —
+  BC-018's client-side check in `handleJobFinalize` is only a UX guard;
+  anyone hitting the REST API directly could still bypass it entirely. Both
+  fixed at the true enforcement point (the functions themselves, not just
+  client code). Also pinned `SET search_path = public` on every
+  `SECURITY DEFINER` function found missing it
+  (`credit_collector_wallet`, `dispatch_scheduled_pickups`,
+  `find_nearby_collectors`, `is_verified_collector`, plus the two above) —
+  a known Postgres privilege-escalation class, no behavioral change to
+  their existing logic. Tested against a local Postgres fixture: non-admin
+  blocked from `process_payout` ✅, unauthenticated `anon` blocked at the
+  grant level ✅, real admin succeeds once ✅, calling it again on the same
+  now-PAID request fails (no double-spend) ✅, unpaid paystack pickup
+  blocked from completing ✅, cash pickup completes normally (unaffected,
+  by design — no cryptographic way to verify cash) ✅, verified-paid
+  paystack pickup completes and pays normally ✅. Applied to the live
+  `samasama` project via `supabase db push`, confirmed live via a post-push
+  `supabase db dump`: `anon` no longer in `process_payout`'s grants, all 12
+  `SECURITY DEFINER` functions now show a pinned search_path.
+
+  **Rollback**: `supabase/rollback/20260718020000_security_definer_hardening_DOWN.sql`
+  — restores each function's exact original live body and grants.
+
 ## Migration standards (established here, as the first migration in this project)
 
 Since this repository had no prior migrations to follow a convention from,

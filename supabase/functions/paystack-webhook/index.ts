@@ -55,7 +55,7 @@ serve(async (req) => {
     const { amount, reference, customer, metadata } = data;
     const userId = metadata?.userId;
     const paymentType = metadata?.type || 'unknown';
-    
+
     console.log(`Verified payment of ${amount / 100} GHS from ${customer.email} for ${paymentType}`);
 
     try {
@@ -75,11 +75,30 @@ serve(async (req) => {
       // b) Handle specific business logic based on payment type
       if (paymentType === 'wallet_topup') {
         // Increment wallet balance
-        const { error: walletError } = await supabase.rpc('increment_wallet', { 
-          row_id: userId, 
-          amount_to_add: amount / 100 
+        const { error: walletError } = await supabase.rpc('increment_wallet', {
+          row_id: userId,
+          amount_to_add: amount / 100
         });
         if (walletError) throw walletError;
+      }
+
+      // c) BC-018: a pickup's card/MoMo payment is only ever considered
+      // verified once it lands here — this is the one write path that a
+      // customer's own client can't forge (this function runs under the
+      // service-role key, after a real HMAC-verified Paystack event).
+      // handleJobFinalize (App.tsx) refuses to let a collector complete a
+      // paystack-method job and get paid until this flips to 'paid'.
+      if (paymentType === 'pickup_payment') {
+        const pickupId = metadata?.pickupId;
+        if (pickupId) {
+          const { error: pickupError } = await supabase
+            .from('pickups')
+            .update({ payment_status: 'paid', payment_method: 'paystack' })
+            .eq('id', pickupId);
+          if (pickupError) throw pickupError;
+        } else {
+          console.error('pickup_payment webhook event missing metadata.pickupId — could not mark any pickup as paid.');
+        }
       }
 
       return new Response(JSON.stringify({ status: "success" }), {

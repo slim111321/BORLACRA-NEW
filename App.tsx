@@ -1374,7 +1374,7 @@ export default function App() {
   // Bulletproof Collector Info Fetcher & Poller: If we are in a collector assigned step but missing collector details, fetch them continuously until we get them!
   useEffect(() => {
     let interval: NodeJS.Timeout;
-    const needsCollector = (step === AppStep.COLLECTOR_FOUND || step === AppStep.CUSTOMER_PICKUP_ONGOING || activePickup?.status === 'assigned' || activePickup?.status === 'collected') && (!activePickup?.collector || !activePickup.collector.full_name || activePickup.collector.full_name === 'Collector' || (!activePickup.collector.vehicle_details?.plate && !activePickup.collector.vehicle_number)) && activePickup?.id;
+    const needsCollector = (step === AppStep.COLLECTOR_FOUND || activePickup?.status === 'assigned' || activePickup?.status === 'collected') && (!activePickup?.collector || !activePickup.collector.full_name || activePickup.collector.full_name === 'Collector' || (!activePickup.collector.vehicle_details?.plate && !activePickup.collector.vehicle_number)) && activePickup?.id;
     
     if (needsCollector) {
       console.log('[Sync] Active pickup missing collector info. Starting aggressive polling for pickup:', activePickup.id);
@@ -2270,6 +2270,24 @@ export default function App() {
 
   const handleJobFinalize = async () => {
     if (!activePickup?.id) return;
+
+    // BC-018: for a card/MoMo job, only the Paystack webhook (verified
+    // signature) ever sets payment_status='paid' — fetch both columns fresh
+    // from the DB rather than trusting local activePickup state, since
+    // neither the collector's payment_method nor payment_status is
+    // guaranteed to have propagated here via realtime yet. Cash jobs have
+    // no digital verification possible, so they're unaffected, same as
+    // before this check existed.
+    const { data: latestPayment } = await supabase
+      .from('pickups')
+      .select('payment_method, payment_status')
+      .eq('id', activePickup.id)
+      .maybeSingle();
+    if (latestPayment?.payment_method === 'paystack' && latestPayment?.payment_status !== 'paid') {
+      Alert.alert('Payment Not Confirmed', "The customer's card/MoMo payment hasn't been confirmed yet. Please wait a moment and try again.");
+      return;
+    }
+
     setIsFinalizingJob(true);
     const { error } = await supabase
       .from('pickups')
@@ -2736,9 +2754,9 @@ export default function App() {
     schedulePredictiveReminder(4);
     if (splitWays > 1) {
       Alert.alert(
-        'Payment Split Complete!',
-        `You paid your share. Copy this link and send it to your WhatsApp group so neighbors can pay the remaining GH₵ ${(splitAmount * (splitWays - 1)).toFixed(2)}: \n\nsam.sa/pay/split-AB892`,
-        [{ text: 'Copy & Finish', onPress: () => {
+        'Your Share is Paid',
+        `You paid your share (GH₵ ${splitAmount.toFixed(2)}). Group payment links aren't available yet — please arrange with your neighbors directly to cover the remaining GH₵ ${(splitAmount * (splitWays - 1)).toFixed(2)}.`,
+        [{ text: 'Finish', onPress: () => {
           setTimeout(() => {
             setPaymentSuccess(false);
             resetBookingStates();
@@ -4126,6 +4144,7 @@ export default function App() {
                       userId: user?.id,
                       userEmail: user?.email,
                       type: 'pickup_payment',
+                      pickupId: activePickup?.id,
                       splitWays: splitWays,
                       amountRecieved: splitAmount
                     }}
@@ -4170,8 +4189,20 @@ export default function App() {
 
             {!isPaying && (
               <View style={{ position: 'absolute', bottom: 20, left: 24, right: 24 }}>
-                <Button 
-                  onPress={() => {
+                <Button
+                  onPress={async () => {
+                    // BC-018: record which method the customer chose, on the
+                    // pickup row itself, before anything else happens — this
+                    // is what lets handleJobFinalize later tell a genuinely
+                    // unpaid card/MoMo job apart from a cash one. A failed
+                    // write here is non-fatal to the payment flow itself.
+                    if (activePickup?.id) {
+                      const { error: methodError } = await supabase
+                        .from('pickups')
+                        .update({ payment_method: selectedPaymentMethod === 'paystack' ? 'paystack' : 'cash' })
+                        .eq('id', activePickup.id);
+                      if (methodError) console.error('[Payment] Could not record payment_method:', methodError.message);
+                    }
                     if (selectedPaymentMethod === 'paystack') {
                       setIsPaying(true);
                       return;
@@ -4999,31 +5030,7 @@ export default function App() {
                   </View>
                 </View>
                 <TouchableOpacity
-                  onPress={() => Alert.alert('Claim Reward', 'Do you want to convert ' + loyaltyPoints + ' pts to GHS Airtime or ECG tokens?', [
-                    {text: 'Cancel', style: 'cancel'},
-                    {text: 'Redeem', onPress: async () => {
-                      if (loyaltyPoints < 100) {
-                        Alert.alert('Oops', 'You need at least 100 points to redeem.');
-                        return;
-                      }
-                      if (!user?.id) return;
-                      // This used to only update local state — points
-                      // reset to their pre-redeem value on next refresh
-                      // since profiles.loyalty_points was never actually
-                      // written, and no airtime was ever really sent.
-                      const newBalance = loyaltyPoints - 100;
-                      const { error } = await supabase
-                        .from('profiles')
-                        .update({ loyalty_points: newBalance })
-                        .eq('id', user.id);
-                      if (error) {
-                        Alert.alert('Error', 'Could not redeem points right now: ' + error.message);
-                        return;
-                      }
-                      setLoyaltyPoints(newBalance);
-                      Alert.alert('Success', 'GH₵ 10 Airtime sent to your phone!');
-                    }}
-                  ])}
+                  onPress={() => Alert.alert('Coming Soon', 'Redeeming points for Airtime or ECG tokens isn\'t available yet. Your ' + loyaltyPoints + ' pts are safe and waiting.')}
                   style={{ backgroundColor: '#06C167', paddingVertical: 12, borderRadius: 12, alignItems: 'center' }}>
                   <Text style={{ color: '#fff', fontWeight: 'bold', fontSize: 16 }}>REDEEM TO AIRTIME</Text>
                 </TouchableOpacity>
@@ -6137,14 +6144,16 @@ export default function App() {
 
               {/* Susu & Micro Loans */}
               <View style={{ flexDirection: 'row', gap: 12, marginBottom: 24 }}>
-                <View style={{ flex: 1, backgroundColor: '#FEF3C7', padding: 20, borderRadius: 16 }}>
+                <TouchableOpacity
+                  onPress={() => setStep(AppStep.COLLECTOR_WALLET)}
+                  style={{ flex: 1, backgroundColor: '#FEF3C7', padding: 20, borderRadius: 16 }}>
                   <Banknote size={24} color="#D97706" style={{ marginBottom: 12 }} />
                   <Text style={{ color: '#92400E', fontSize: 12, fontWeight: '700', textTransform: 'uppercase' }}>Susu Wallet</Text>
-                  <Text style={{ color: '#B45309', fontSize: 24, fontWeight: '800', marginVertical: 4 }}>GH₵ 350</Text>
+                  <Text style={{ color: '#B45309', fontSize: 24, fontWeight: '800', marginVertical: 4 }}>GH₵ {walletBalance.toFixed(2)}</Text>
                   <Text style={{ color: '#D97706', fontSize: 11 }}>Saved automatically</Text>
-                </View>
+                </TouchableOpacity>
                 <TouchableOpacity
-                  onPress={() => Alert.alert('Micro-Loan Approved!', 'Congratulations! With 50 completed trips, you are pre-approved for GH₵ 500 for vehicle maintenance.')} 
+                  onPress={() => Alert.alert('Micro-Loans Coming Soon', 'Micro-loans for vehicle maintenance (tires, fuel, parts) are not yet available. Check back soon.')}
                   style={{ flex: 1, backgroundColor: '#DBEAFE', padding: 20, borderRadius: 16, justifyContent: 'center' }}>
                   <Recycle size={24} color="#2563EB" style={{ marginBottom: 12 }} />
                   <Text style={{ color: '#1E40AF', fontSize: 14, fontWeight: '700' }}>Apply for Micro-Loan</Text>
@@ -6217,42 +6226,64 @@ export default function App() {
             </View>
 
             <ScrollView contentContainerStyle={{ padding: 20 }}>
-              {/* Tier Card */}
-              <View style={{ backgroundColor: '#111', borderRadius: 24, padding: 24, marginBottom: 24, overflow: 'hidden' }}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-                  <View>
-                    <Text style={{ color: '#FCD34D', fontSize: 14, fontWeight: '700', letterSpacing: 1, marginBottom: 8 }}>GOLD TIER</Text>
-                    <Text style={{ color: '#fff', fontSize: 36, fontWeight: '800' }}>
-                      {collectorMetric?.avg_rating ? Number(collectorMetric.avg_rating).toFixed(1) : '—'}
-                    </Text>
-                    <View style={{ flexDirection: 'row', marginTop: 4 }}>
-                      {[1, 2, 3, 4, 5].map(i => (
-                        <Star key={i} size={20} color="#FCD34D" fill={i <= Math.round(collectorMetric?.avg_rating || 0) ? '#FCD34D' : 'transparent'} style={{ marginRight: 4 }} />
-                      ))}
+              {/* Tier Card — tier & progress computed from the real avg_rating, not fixed at Gold/80% */}
+              {(() => {
+                const rating = Number(collectorMetric?.avg_rating) || 0;
+                const tiers = [
+                  { name: 'BRONZE', min: 0 },
+                  { name: 'SILVER', min: 3.5 },
+                  { name: 'GOLD', min: 4.5 },
+                  { name: 'PLATINUM', min: 4.9 },
+                ];
+                let tierIndex = 0;
+                for (let i = 0; i < tiers.length; i++) {
+                  if (rating >= tiers[i].min) tierIndex = i;
+                }
+                const currentTier = tiers[tierIndex];
+                const nextTier = tiers[tierIndex + 1];
+                const progressPct = nextTier
+                  ? Math.max(0, Math.min(100, ((rating - currentTier.min) / (nextTier.min - currentTier.min)) * 100))
+                  : 100;
+                return (
+                  <>
+                    <View style={{ backgroundColor: '#111', borderRadius: 24, padding: 24, marginBottom: 24, overflow: 'hidden' }}>
+                      <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                        <View>
+                          <Text style={{ color: '#FCD34D', fontSize: 14, fontWeight: '700', letterSpacing: 1, marginBottom: 8 }}>{currentTier.name} TIER</Text>
+                          <Text style={{ color: '#fff', fontSize: 36, fontWeight: '800' }}>
+                            {collectorMetric?.avg_rating ? Number(collectorMetric.avg_rating).toFixed(1) : '—'}
+                          </Text>
+                          <View style={{ flexDirection: 'row', marginTop: 4 }}>
+                            {[1, 2, 3, 4, 5].map(i => (
+                              <Star key={i} size={20} color="#FCD34D" fill={i <= Math.round(collectorMetric?.avg_rating || 0) ? '#FCD34D' : 'transparent'} style={{ marginRight: 4 }} />
+                            ))}
+                          </View>
+                        </View>
+                        <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: 'rgba(252, 211, 77, 0.2)', alignItems: 'center', justifyContent: 'center' }}>
+                          <Shield size={32} color="#FCD34D" fill="#FCD34D" />
+                        </View>
+                      </View>
+                      <View style={{ marginTop: 24, backgroundColor: 'rgba(255,255,255,0.1)', padding: 12, borderRadius: 12 }}>
+                        <Text style={{ color: '#D1D5DB', fontSize: 12 }}>{nextTier ? `Next Tier: ${nextTier.name[0]}${nextTier.name.slice(1).toLowerCase()} (${nextTier.min} ★)` : 'Highest tier reached'}</Text>
+                        <View style={{ height: 6, backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 3, marginTop: 8 }}>
+                          <View style={{ width: `${progressPct}%`, height: '100%', backgroundColor: '#FCD34D', borderRadius: 3 }} />
+                        </View>
+                      </View>
                     </View>
-                  </View>
-                  <View style={{ width: 60, height: 60, borderRadius: 30, backgroundColor: 'rgba(252, 211, 77, 0.2)', alignItems: 'center', justifyContent: 'center' }}>
-                    <Shield size={32} color="#FCD34D" fill="#FCD34D" />
-                  </View>
-                </View>
-                <View style={{ marginTop: 24, backgroundColor: 'rgba(255,255,255,0.1)', padding: 12, borderRadius: 12 }}>
-                  <Text style={{ color: '#D1D5DB', fontSize: 12 }}>Next Tier: Platinum (4.9 ★)</Text>
-                  <View style={{ height: 6, backgroundColor: 'rgba(255,255,255,0.2)', borderRadius: 3, marginTop: 8 }}>
-                    <View style={{ width: '80%', height: '100%', backgroundColor: '#FCD34D', borderRadius: 3 }} />
-                  </View>
-                </View>
-              </View>
 
-              {/* Partner Fuel Discount */}
-              <View style={{ backgroundColor: '#F0FDF4', borderRadius: 16, padding: 20, marginBottom: 24, borderWidth: 1, borderColor: '#BBF7D0', flexDirection: 'row', alignItems: 'center' }}>
-                <View style={{ width: 50, height: 50, borderRadius: 25, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center', marginRight: 16 }}>
-                  <Truck size={24} color="#fff" />
-                </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={{ color: '#065F46', fontSize: 14, fontWeight: '800', marginBottom: 4 }}>GOIL Fuel Partner Discount</Text>
-                  <Text style={{ color: '#047857', fontSize: 12 }}>Show your Gold Badge at any GOIL station to receive 3% off all fuel purchases today!</Text>
-                </View>
-              </View>
+                    {/* Partner Fuel Discount */}
+                    <View style={{ backgroundColor: '#F0FDF4', borderRadius: 16, padding: 20, marginBottom: 24, borderWidth: 1, borderColor: '#BBF7D0', flexDirection: 'row', alignItems: 'center' }}>
+                      <View style={{ width: 50, height: 50, borderRadius: 25, backgroundColor: '#06C167', alignItems: 'center', justifyContent: 'center', marginRight: 16 }}>
+                        <Truck size={24} color="#fff" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: '#065F46', fontSize: 14, fontWeight: '800', marginBottom: 4 }}>GOIL Fuel Partner Discount</Text>
+                        <Text style={{ color: '#047857', fontSize: 12 }}>Show your {currentTier.name[0]}{currentTier.name.slice(1).toLowerCase()} Badge at any GOIL station to receive 3% off all fuel purchases today!</Text>
+                      </View>
+                    </View>
+                  </>
+                );
+              })()}
 
               {/* Metrics Grid */}
               <View style={{ flexDirection: 'row', gap: 12, marginBottom: 32 }}>
@@ -8079,25 +8110,6 @@ export default function App() {
                     if (reviewInsertError) {
                       console.error('[Rating] Failed to insert into reviews:', reviewInsertError);
                     }
-
-                    // 2b. Backup insert into incident_reports to bypass strict RLS on reviews table.
-                    // This "backup" was never actually reliable — incident_reports
-                    // has no "severity" column ("priority" is the real one), so this
-                    // insert 400'd every time. It's read back on the admin side
-                    // (web-admin fetchPerformanceData) as inc.priority, not
-                    // inc.severity, for the same reason. type: 'REVIEW' rows are
-                    // filtered out of the Incidents tab (BC-014), so reusing
-                    // priority to hold the numeric rating here doesn't collide
-                    // with its CRITICAL/URGENT/NORMAL meaning on real incidents.
-                    const { error: reviewBackupError } = await supabase.from('incident_reports').insert({
-                      collector_id: ratingCollector.id,
-                      pickup_id: ratingPickupId || activePickup?.id || null,
-                      type: 'REVIEW',
-                      description: finalComment,
-                      priority: selectedRating.toString(),
-                      status: selectedRating <= 2 ? 'PENDING' : 'RESOLVED'
-                    });
-                    if (reviewBackupError) console.error('[Rating] Failed to insert incident_reports backup:', reviewBackupError);
 
                     // 3. Always broadcast to admin global alerts so Admin Dashboard updates instantly
                     const adminAlertChan = supabase.channel('admin_global_alerts');
