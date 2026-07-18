@@ -1,7 +1,16 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { supabase } from './lib/supabase';
 import LiveMap from './components/LiveMap';
+import MapboxLiveMap from './components/MapboxLiveMap';
 import ActivityFeed from './components/ActivityFeed';
+
+// Same provider switch the routing/geocoding abstraction uses
+// (services/maps/index.ts) — applied here too so the whole app, including
+// which map widget renders, follows one VITE_MAP_PROVIDER env var. The
+// Leaflet-based LiveMap is left fully intact; this only decides which of
+// the two gets rendered.
+const mapProviderName = (import.meta.env.VITE_MAP_PROVIDER || 'mapbox').toLowerCase().trim();
+const LiveMapComponent = mapProviderName === 'osm' ? LiveMap : MapboxLiveMap;
 
 import { 
   Lock, 
@@ -1876,9 +1885,9 @@ function App() {
               </div>
 
               <div className="section-card" style={{ padding: 0, border: 'none' }}>
-                <LiveMap 
-                  collectorLocations={collectorLocations} 
-                  activePickups={activePickups} 
+                <LiveMapComponent
+                  collectorLocations={collectorLocations}
+                  activePickups={activePickups}
                   showHeatmap={showHeatmap}
                   heatmapData={heatmapData}
                 />

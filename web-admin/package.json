@@ -12,8 +12,10 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.105.4",
     "@types/leaflet": "^1.9.21",
+    "@types/mapbox-gl": "^3.4.1",
     "leaflet": "^1.9.4",
     "lucide-react": "^1.14.0",
+    "mapbox-gl": "^3.26.0",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
     "recharts": "^3.8.1"

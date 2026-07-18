@@ -44,6 +44,7 @@ import { SubscriptionsScreen } from './components/SubscriptionsScreen';
 import { analyzeTrashImage, TrashEstimate } from './utils/aiEstimator';
 import { getVehicleOptions, inferRecommendedVehicleName } from './utils/vehicleDispatch';
 import { getRouteDistanceAndDuration, formatEtaMinutes, formatDistanceKm } from './utils/routing';
+import { activeMapProvider, GeocodeResult } from './services/maps';
 import {
   getUserLocation,
   updateCollectorLocation,
@@ -338,7 +339,7 @@ export default function App() {
     }
   };
 
-  // ── NOMINATIM LIVE LOCATION SEARCH ──────────────────────────────────────
+  // ── LIVE LOCATION SEARCH (via activeMapProvider — mapbox/osm/google) ────
   const searchNominatim = useCallback(async (query: string) => {
     if (!query || query.trim().length < 3) {
       setLocationSearchResults([]);
@@ -346,16 +347,10 @@ export default function App() {
     }
     setIsSearchingLiveLocation(true);
     try {
-      // Bias results toward Ghana for better local relevance; dedupe=1 avoids
-      // near-identical duplicate rows for the same place.
-      const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(query + ', Ghana')}&format=json&addressdetails=1&limit=8&countrycodes=gh&dedupe=1`;
-      const res = await fetch(url, {
-        headers: { 'Accept-Language': 'en', 'User-Agent': 'BorlaApp/1.0' }
-      });
-      const data = await res.json();
-      setLocationSearchResults(Array.isArray(data) ? data : []);
+      const results = await activeMapProvider.geocode(query);
+      setLocationSearchResults(results);
     } catch (e) {
-      console.error('Nominatim search error:', e);
+      console.error('[maps] geocode search error:', e);
       setLocationSearchResults([]);
     } finally {
       setIsSearchingLiveLocation(false);
@@ -368,24 +363,12 @@ export default function App() {
     locationSearchTimeoutRef.current = setTimeout(() => searchNominatim(text), 400);
   };
 
-  const handleLocationSelect = (result: any) => {
-    // Build a clean display address from the result
-    const name = result.name || result.display_name.split(',')[0];
-    const address = result.display_name;
-    setPickupAddress(address);
-    setLocationSearchQuery(name);
+  const handleLocationSelect = (result: GeocodeResult) => {
+    setPickupAddress(result.address || result.label);
+    setLocationSearchQuery(result.label);
     setLocationSearchResults([]);
-    // This never actually moved the map pin or updated the coordinates used
-    // for booking — Nominatim's response already includes lat/lon per
-    // result, it just wasn't being read. Selecting a suggestion updated the
-    // text field only, so the app kept using whatever GPS/previous
-    // coordinates it already had, silently ignoring what was searched for.
-    const lat = parseFloat(result.lat);
-    const lon = parseFloat(result.lon);
-    if (!isNaN(lat) && !isNaN(lon)) {
-      setUserCoords({ latitude: lat, longitude: lon });
-      setLocationLabel(name);
-    }
+    setUserCoords(result.coordinate);
+    setLocationLabel(result.label);
   };
   // ── END NOMINATIM ────────────────────────────────────────────────────────
 
@@ -509,8 +492,12 @@ export default function App() {
   const [pickupAddress, setPickupAddress] = useState('Kasoa New Market, Ghana');
   // Nominatim live location search state
   const [locationSearchQuery, setLocationSearchQuery] = useState('');
-  const [locationSearchResults, setLocationSearchResults] = useState<any[]>([]);
+  const [locationSearchResults, setLocationSearchResults] = useState<GeocodeResult[]>([]);
   const [isSearchingLiveLocation, setIsSearchingLiveLocation] = useState(false);
+  // Was referenced (setIsSearchingLocation) by the manual map-picker search
+  // box below without ever being declared — that call threw a ReferenceError
+  // at runtime on every submit. Declared here now that it's a real state.
+  const [isSearchingLocation, setIsSearchingLocation] = useState(false);
   const locationSearchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState<'paystack' | 'cash'>('paystack');
@@ -2918,9 +2905,8 @@ export default function App() {
         if (coords) {
           setUserCoords(coords);
           // Reverse-geocode label
-          fetch(`https://nominatim.openstreetmap.org/reverse?lat=${coords.latitude}&lon=${coords.longitude}&format=json`)
-            .then(r => r.json())
-            .then(d => setLocationLabel(d.address?.suburb || d.address?.town || 'Your Location'))
+          activeMapProvider.reverseGeocode(coords)
+            .then(r => setLocationLabel(r?.label || 'Your Location'))
             .catch(() => setLocationLabel('Location found'));
         }
       });
@@ -3486,15 +3472,11 @@ export default function App() {
                     {locationSearchResults.length > 0 && (
                       <View style={{ backgroundColor: '#fff', borderRadius: 14, marginTop: 6, borderWidth: 1, borderColor: '#E5E7EB', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.1, shadowRadius: 12, elevation: 8 }}>
                         {locationSearchResults.map((result, i) => {
-                          const parts = result.display_name.split(', ');
-                          const name = parts[0];
-                          const address = parts.slice(1, 4).join(', ');
                           return (
                             <TouchableOpacity
-                              key={result.place_id}
+                              key={result.id}
                               onPress={() => {
                                 handleLocationSelect(result);
-                                setPickupAddress(result.display_name);
                                 next();
                               }}
                               style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 13, borderBottomWidth: i < locationSearchResults.length - 1 ? 1 : 0, borderBottomColor: '#F3F4F6' }}
@@ -3503,8 +3485,8 @@ export default function App() {
                                 <MapPin size={16} color="#06C167" />
                               </View>
                               <View style={{ flex: 1 }}>
-                                <Text style={{ fontSize: 14, fontWeight: '700', color: '#111827' }} numberOfLines={1}>{name}</Text>
-                                <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }} numberOfLines={1}>{address}</Text>
+                                <Text style={{ fontSize: 14, fontWeight: '700', color: '#111827' }} numberOfLines={1}>{result.label}</Text>
+                                <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }} numberOfLines={1}>{result.address}</Text>
                               </View>
                             </TouchableOpacity>
                           );
@@ -8178,13 +8160,9 @@ export default function App() {
                     if (manualLocation.trim()) {
                       setIsSearchingLocation(true);
                       try {
-                        const resp = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(manualLocation)}&format=json&limit=1`, {
-                          headers: { 'User-Agent': 'SamSaApp/1.0' }
-                        });
-                        const results = await resp.json();
-                        if (results && results.length > 0) {
-                          const { lat, lon } = results[0];
-                          setPickerCenter({ latitude: parseFloat(lat), longitude: parseFloat(lon) });
+                        const results = await activeMapProvider.geocode(manualLocation);
+                        if (results.length > 0) {
+                          setPickerCenter(results[0].coordinate);
                         } else {
                           Alert.alert('Not Found', 'Could not find that area. Please zoom out and drag the map manually.');
                         }
