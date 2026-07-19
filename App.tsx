@@ -248,7 +248,7 @@ export default function App() {
   const [userProfile, setUserProfile] = useState<any>(null);
   const [showLocationModal, setShowLocationModal] = useState(false);
   const [manualLocation, setManualLocation] = useState('');
-  const [pickerCenter, setPickerCenter] = useState<UserCoords | null>(null);
+  const [manualLocationResults, setManualLocationResults] = useState<GeocodeResult[]>([]);
   
   const [collectorProfile, setCollectorProfile] = useState({
     photo: '',
@@ -2956,10 +2956,23 @@ export default function App() {
     };
   }, [user?.id, role]);
 
-  // ── Collector: push live GPS every 30 s while on dashboard ──────────────
+  // ── Collector: push live GPS every 30 s while online ─────────────────────
+  // This is the only thing that actually sets collector_locations.is_online
+  // (toggling the "Online" switch just updates a separate collector_status
+  // display field — see updateCollectorStatus). This used to only run while
+  // step === COLLECTOR_DASHBOARD, so a collector who stayed "online" but
+  // navigated to Wallet/Schedule/Safety/Profile/etc. had their location
+  // silently stop refreshing — after 2 minutes isLocationFresh() filters
+  // them out of every customer search, even though their own UI still shows
+  // "Online". Now runs whenever role===COLLECTOR && collectorOnline,
+  // regardless of which screen they're on. (Deliberately NOT also gated on
+  // userProfile?.is_verified here — RLS already rejects the upsert
+  // server-side for an unverified collector, and gating on it client-side
+  // too risks silently blocking real, verified collectors if userProfile
+  // hasn't freshly loaded that field for any reason. Logging added below so
+  // this is diagnosable instead of silent either way.)
   useEffect(() => {
-    if (role !== UserRole.COLLECTOR || step !== AppStep.COLLECTOR_DASHBOARD) {
-      // Clear the interval when not on collector dashboard
+    if (role !== UserRole.COLLECTOR || !collectorOnline) {
       if (collectorLocationIntervalRef.current) {
         clearInterval(collectorLocationIntervalRef.current);
         collectorLocationIntervalRef.current = null;
@@ -2968,18 +2981,24 @@ export default function App() {
     }
 
     const pushLocation = async () => {
-      if (!user?.id) return;
+      if (!user?.id) {
+        console.log('[Location] Skipping push: no user.id yet');
+        return;
+      }
       const coords = await getUserLocation();
-      if (coords) {
-        const matched = await updateCollectorLocation(user.id, coords, collectorOnline);
-        if (matched) {
-          playPing();
-          Alert.alert(
-            '🙋 Customer Nearby!',
-            'A customer in your area tried to book a pickup but no collector was available. They have just been notified that you are near — be ready for an incoming request!',
-            [{ text: 'Got it!', style: 'default' }]
-          );
-        }
+      if (!coords) {
+        console.warn('[Location] getUserLocation() returned null — check location permission (on a simulator, set a location via Features > Location)');
+        return;
+      }
+      console.log(`[Location] Pushing collector location: ${coords.latitude}, ${coords.longitude} (online=${collectorOnline})`);
+      const matched = await updateCollectorLocation(user.id, coords, collectorOnline);
+      if (matched) {
+        playPing();
+        Alert.alert(
+          '🙋 Customer Nearby!',
+          'A customer in your area tried to book a pickup but no collector was available. They have just been notified that you are near — be ready for an incoming request!',
+          [{ text: 'Got it!', style: 'default' }]
+        );
       }
     };
 
@@ -2993,7 +3012,7 @@ export default function App() {
         collectorLocationIntervalRef.current = null;
       }
     };
-  }, [role, step, user?.id, collectorOnline]);
+  }, [role, user?.id, collectorOnline]);
 
   useEffect(() => {
     let interval: NodeJS.Timeout;
@@ -8141,9 +8160,18 @@ export default function App() {
           </View>
         </Modal>
 
-        {/* Location Manual Edit Modal - Fullscreen Interactive Picker */}
+        {/* Location Manual Edit Modal - search-to-select. Used to require
+            dragging the map to fine-tune a pin because the old OSM/Leaflet
+            geocoding wasn't precise enough on its own — Mapbox's geocoding
+            is accurate enough that picking a search result now sets the
+            exact location directly, no drag step needed. */}
         {showLocationModal && (
           <View style={[StyleSheet.absoluteFill, { backgroundColor: '#fff', zIndex: 9999 }]}>
+            <MapComponent
+              userLatitude={userCoords?.latitude || 5.5319}
+              userLongitude={userCoords?.longitude || -0.4281}
+            />
+
             {/* Top Search Bar */}
             <View style={{ position: 'absolute', top: 50, left: 20, right: 20, zIndex: 10 }}>
               <View style={{ flexDirection: 'row', alignItems: 'center' }}>
@@ -8152,67 +8180,56 @@ export default function App() {
                 </TouchableOpacity>
                 <TextInput
                   style={{ flex: 1, backgroundColor: '#fff', padding: 14, borderRadius: 12, fontSize: 16, shadowColor: '#000', shadowOpacity: 0.1, shadowRadius: 10, elevation: 5 }}
-                  placeholder="Search to jump to an area..."
+                  placeholder="Search for your exact location..."
                   value={manualLocation}
                   onChangeText={setManualLocation}
                   returnKeyType="search"
+                  autoFocus
                   onSubmitEditing={async () => {
                     if (manualLocation.trim()) {
                       setIsSearchingLocation(true);
                       try {
                         const results = await activeMapProvider.geocode(manualLocation);
-                        if (results.length > 0) {
-                          setPickerCenter(results[0].coordinate);
-                        } else {
-                          Alert.alert('Not Found', 'Could not find that area. Please zoom out and drag the map manually.');
+                        setManualLocationResults(results);
+                        if (results.length === 0) {
+                          Alert.alert('Not Found', 'Could not find that location. Try a more specific search.');
                         }
                       } catch (e) {
-                        Alert.alert('Error', 'Connection failed. Please drag the map manually.');
+                        Alert.alert('Error', 'Connection failed. Please try again.');
                       } finally {
                         setIsSearchingLocation(false);
                       }
                     }
                   }}
                 />
+                {isSearchingLocation && <ActivityIndicator size="small" color="#06C167" style={{ marginLeft: 12 }} />}
               </View>
-              <View style={{ backgroundColor: 'rgba(0,0,0,0.6)', padding: 8, borderRadius: 8, marginTop: 12, alignSelf: 'center' }}>
-                <Text style={{ color: '#fff', fontSize: 12, fontWeight: '700' }}>Drag the map to place the pin on your exact location</Text>
-              </View>
-            </View>
 
-            {/* Draggable Map */}
-            <MapComponent 
-              userLatitude={pickerCenter?.latitude || userCoords?.latitude || 5.5319} 
-              userLongitude={pickerCenter?.longitude || userCoords?.longitude || -0.4281}
-              onRegionChange={(coords) => {
-                userCoordsRef.current = coords; // Debounced/rapid update via ref
-              }}
-            />
-
-            {/* Center Pin Crosshair */}
-            <View style={{ position: 'absolute', top: '50%', left: '50%', marginTop: -24, marginLeft: -16, pointerEvents: 'none', alignItems: 'center' }}>
-              <View style={{ backgroundColor: '#111', paddingHorizontal: 12, paddingVertical: 4, borderRadius: 12, marginBottom: 4 }}>
-                <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>PICKUP HERE</Text>
-              </View>
-              <MapPin size={32} color="#06C167" fill="#111" />
-            </View>
-
-            {/* Bottom Confirm */}
-            <View style={{ position: 'absolute', bottom: 40, left: 20, right: 20, backgroundColor: '#fff', padding: 20, borderRadius: 24, shadowColor: '#000', shadowOpacity: 0.15, shadowRadius: 20, elevation: 10 }}>
-              <Text style={{ fontSize: 18, fontWeight: '800', marginBottom: 4, textAlign: 'center' }}>Confirm Pickup Spot</Text>
-              <Text style={{ color: '#6B7280', fontSize: 13, textAlign: 'center', marginBottom: 16 }}>The collector will navigate exactly to this pin.</Text>
-              <Button onPress={() => {
-                if (userCoordsRef.current) {
-                  setUserCoords(userCoordsRef.current);
-                  setLocationLabel('Dropped Pin');
-                } else if (pickerCenter) {
-                  setUserCoords(pickerCenter);
-                  setLocationLabel('Dropped Pin');
-                }
-                setShowLocationModal(false);
-              }}>
-                Confirm Exact Location
-              </Button>
+              {manualLocationResults.length > 0 && (
+                <View style={{ backgroundColor: '#fff', borderRadius: 14, marginTop: 6, borderWidth: 1, borderColor: '#E5E7EB', shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.1, shadowRadius: 12, elevation: 8 }}>
+                  {manualLocationResults.map((result, i) => (
+                    <TouchableOpacity
+                      key={result.id}
+                      onPress={() => {
+                        setUserCoords(result.coordinate);
+                        setLocationLabel(result.label);
+                        setManualLocation('');
+                        setManualLocationResults([]);
+                        setShowLocationModal(false);
+                      }}
+                      style={{ flexDirection: 'row', alignItems: 'center', paddingHorizontal: 14, paddingVertical: 13, borderBottomWidth: i < manualLocationResults.length - 1 ? 1 : 0, borderBottomColor: '#F3F4F6' }}
+                    >
+                      <View style={{ width: 34, height: 34, borderRadius: 17, backgroundColor: '#F0FDF4', alignItems: 'center', justifyContent: 'center', marginRight: 12 }}>
+                        <MapPin size={16} color="#06C167" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ fontSize: 14, fontWeight: '700', color: '#111827' }} numberOfLines={1}>{result.label}</Text>
+                        <Text style={{ fontSize: 12, color: '#6B7280', marginTop: 2 }} numberOfLines={1}>{result.address}</Text>
+                      </View>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+              )}
             </View>
           </View>
         )}

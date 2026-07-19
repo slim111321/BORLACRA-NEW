@@ -50,7 +50,7 @@ export async function updateCollectorLocation(
   coords: UserCoords,
   isOnline: boolean,
 ): Promise<boolean> {
-  await supabase.from('collector_locations').upsert(
+  const { error: upsertError } = await supabase.from('collector_locations').upsert(
     {
       collector_id: collectorId,
       latitude: coords.latitude,
@@ -60,6 +60,12 @@ export async function updateCollectorLocation(
     },
     { onConflict: 'collector_id' },
   );
+  if (upsertError) {
+    // This was previously unchecked — a silently-rejected write here (e.g.
+    // RLS blocking an unverified collector) meant is_online/updated_at
+    // never actually updated, with zero visibility into why.
+    console.error('[Location] Failed to upsert collector_locations:', upsertError.message);
+  }
 
   // If online, check if any customers are waiting nearby right now!
   if (isOnline) {
