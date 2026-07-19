@@ -192,6 +192,27 @@ See `../SCHEMA_NOTES.md` for schema/RLS notes gathered from a real
   **Rollback**: `supabase/rollback/20260718020000_security_definer_hardening_DOWN.sql`
   — restores each function's exact original live body and grants.
 
+- `20260719000000_unmet_pickup_requests.sql` — BC-021: new
+  `unmet_pickup_requests` table for admin-facing demand analytics. Every
+  time a customer's pickup-request coverage check
+  (`find_collectors_within_miles`) returns zero collectors, the app now
+  logs the request's location here, unconditionally — deliberately
+  separate from the existing `missed_bookings` table, which only gets a
+  row when the customer explicitly opts into "Notify Me". RLS: customers
+  can `INSERT` only their own row (`auth.uid() = customer_id`), no
+  select/update grant to customers at all; admins get `SELECT` and
+  `UPDATE` (for the `resolved` flag) via the existing `is_admin()` helper,
+  matching the pattern used by `landfills`/`broadcasts`/`system_settings`.
+  Tested against a local Postgres fixture: customer inserts their own row
+  ✅, customer blocked from inserting a row for someone else ✅, customer
+  cannot `SELECT` even their own row (no policy grants it) ✅, admin can
+  `SELECT` all rows and mark one `resolved` ✅. **Applied to the live
+  `samasama` project** via `supabase db push`, confirmed live via a
+  post-push `supabase db dump` showing the table and all three policies.
+
+  **Rollback**: `supabase/rollback/20260719000000_unmet_pickup_requests_DOWN.sql`
+  — drops the table entirely.
+
 ## Migration standards (established here, as the first migration in this project)
 
 Since this repository had no prior migrations to follow a convention from,

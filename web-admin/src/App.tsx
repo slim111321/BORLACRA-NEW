@@ -3,6 +3,7 @@ import { supabase } from './lib/supabase';
 import LiveMap from './components/LiveMap';
 import MapboxLiveMap from './components/MapboxLiveMap';
 import ActivityFeed from './components/ActivityFeed';
+import { activeMapProvider } from './services/maps';
 
 // Same provider switch the routing/geocoding abstraction uses
 // (services/maps/index.ts) — applied here too so the whole app, including
@@ -73,7 +74,8 @@ function App() {
     totalUsers: 0,
     activeCollectors: 0,
     monthlyRevenue: 0,
-    pendingKYC: []
+    pendingKYC: [],
+    unmetDemandCount7d: 0
   });
   const [landfills, setLandfills] = useState<any[]>([]);
   const [fleetStatus, setFleetStatus] = useState<any[]>([]);
@@ -253,6 +255,10 @@ function App() {
   const [showHeatmap, setShowHeatmap] = useState(false);
   const [heatmapData, setHeatmapData] = useState<any[]>([]);
   const [heatmapTimeRange, setHeatmapTimeRange] = useState('24h');
+  // BC-021: unmet-demand layer/toasts — independent of the pickup heatmap above.
+  const [showUnmetDemandHeatmap, setShowUnmetDemandHeatmap] = useState(false);
+  const [unmetDemandData, setUnmetDemandData] = useState<any[]>([]);
+  const [unmetDemandToasts, setUnmetDemandToasts] = useState<any[]>([]);
   const [collectorMetrics, setCollectorMetrics] = useState<any[]>([]);
 
 
@@ -313,11 +319,20 @@ function App() {
         .eq('is_verified', false)
         .limit(5);
 
+      // BC-021: unmet-demand count, last 7 days.
+      const sevenDaysAgo = new Date();
+      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+      const { count: unmetCount } = await supabase
+        .from('unmet_pickup_requests')
+        .select('*', { count: 'exact', head: true })
+        .gte('requested_at', sevenDaysAgo.toISOString());
+
       setOverview({
         totalUsers: userCount || 0,
         activeCollectors: activeColl || 0,
         monthlyRevenue: totalRev,
-        pendingKYC: kyc || []
+        pendingKYC: kyc || [],
+        unmetDemandCount7d: unmetCount || 0
       });
     } catch (err) {
       console.error('fetchAdminOverview error:', err);
@@ -432,6 +447,27 @@ function App() {
       console.error("Heatmap fetch error:", err);
     }
   }, [heatmapTimeRange]);
+
+  // BC-021: unmet-demand heatmap data — last 30 days, independent of the
+  // pickup-density time-range selector above (that's specific to the
+  // existing pickup heatmap's own filter).
+  const fetchUnmetDemandData = useCallback(async () => {
+    try {
+      const dateLimit = new Date();
+      dateLimit.setDate(dateLimit.getDate() - 30);
+
+      const { data, error } = await supabase
+        .from('unmet_pickup_requests')
+        .select('latitude, longitude, requested_at')
+        .gte('requested_at', dateLimit.toISOString());
+
+      if (error) throw error;
+
+      setUnmetDemandData((data || []).map(p => ({ latitude: p.latitude, longitude: p.longitude, intensity: 0.7 })));
+    } catch (err) {
+      console.error("Unmet demand fetch error:", err);
+    }
+  }, []);
 
   const fetchPerformanceData = useCallback(async () => {
     try {
@@ -825,6 +861,26 @@ function App() {
         playPing();
         fetchUserData(); // Refresh so admin can see the new doc immediately
       })
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'unmet_pickup_requests' }, async (payload) => {
+        console.log('[AdminAlert] Unmet pickup request:', payload);
+        playPing();
+        const row: any = payload.new;
+        let label = `${Number(row.latitude).toFixed(4)}, ${Number(row.longitude).toFixed(4)}`;
+        try {
+          const result = await activeMapProvider.reverseGeocode({ latitude: row.latitude, longitude: row.longitude });
+          if (result) label = result.label;
+        } catch (e) {
+          console.error('[AdminAlert] Reverse geocode failed for unmet demand toast:', e);
+        }
+        const toastId = row.id;
+        setUnmetDemandToasts(prev => [...prev, { id: toastId, label, requested_at: row.requested_at }]);
+        setTimeout(() => {
+          setUnmetDemandToasts(prev => prev.filter(t => t.id !== toastId));
+        }, 12000);
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('📍 Unmet Pickup Demand', { body: `A customer near ${label} found no collectors available.` });
+        }
+      })
       .subscribe();
 
     return () => {
@@ -886,13 +942,14 @@ function App() {
       if (activeTab === 'map') {
         fetchLiveOpsData();
         fetchHeatmapData();
+        fetchUnmetDemandData();
       }
       if (activeTab === 'landfills') fetchLandfills();
       if (activeTab === 'intelligence') fetchIntelligenceData();
       if (activeTab === 'performance') { fetchPerformanceData(); fetchBroadcastData(); }
       if (activeTab === 'broadcasts') fetchBroadcastData();
     }
-  }, [isAdmin, activeTab, heatmapTimeRange, fetchAdminOverview, fetchLogisticsData, fetchFinanceData, fetchUserData, fetchLiveOpsData, fetchIncidents, fetchHeatmapData, fetchLandfills, fetchIntelligenceData, fetchPerformanceData, fetchBroadcastData]);
+  }, [isAdmin, activeTab, heatmapTimeRange, fetchAdminOverview, fetchLogisticsData, fetchFinanceData, fetchUserData, fetchLiveOpsData, fetchIncidents, fetchHeatmapData, fetchUnmetDemandData, fetchLandfills, fetchIntelligenceData, fetchPerformanceData, fetchBroadcastData]);
 
 
 
@@ -1114,6 +1171,39 @@ function App() {
   return (
 
     <div className="admin-layout">
+      {/* BC-021: unmet-demand toasts — global overlay so they show up regardless of which tab is open */}
+      {unmetDemandToasts.length > 0 && (
+        <div style={{ position: 'fixed', top: '1.5rem', right: '1.5rem', zIndex: 9999, display: 'flex', flexDirection: 'column', gap: '0.75rem', maxWidth: '360px' }}>
+          {unmetDemandToasts.map(toast => (
+            <div
+              key={toast.id}
+              style={{
+                backgroundColor: '#1e293b',
+                border: '1px solid #dc2626',
+                borderRadius: '0.75rem',
+                padding: '1rem',
+                boxShadow: '0 10px 30px rgba(0,0,0,0.3)',
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '0.75rem',
+              }}
+            >
+              <AlertTriangle size={20} color="#dc2626" style={{ flexShrink: 0, marginTop: 2 }} />
+              <div style={{ flex: 1 }}>
+                <p style={{ margin: 0, fontWeight: 700, fontSize: '0.875rem', color: '#fff' }}>Unmet Pickup Demand</p>
+                <p style={{ margin: '0.25rem 0 0', fontSize: '0.8rem', color: '#cbd5e1' }}>No collectors were available near {toast.label}.</p>
+              </div>
+              <button
+                onClick={() => setUnmetDemandToasts(prev => prev.filter(t => t.id !== toast.id))}
+                style={{ background: 'none', border: 'none', color: '#94a3b8', cursor: 'pointer', fontSize: '1rem', lineHeight: 1, padding: 0 }}
+                aria-label="Dismiss"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       <aside className="sidebar">
         <div className="sidebar-logo">
           <img src="/logo.png" alt="SamSa" style={{ height: 36 }} />
@@ -1236,6 +1326,13 @@ function App() {
                   <div>
                     <p className="stat-label">Gross Revenue</p>
                     <p className="stat-value">GH₵ {overview.monthlyRevenue.toFixed(2)}</p>
+                  </div>
+                </div>
+                <div className="stat-card">
+                  <div className="stat-icon" style={{ color: '#dc2626', backgroundColor: 'rgba(220, 38, 38, 0.1)' }}><AlertTriangle size={24} /></div>
+                  <div>
+                    <p className="stat-label">Unmet Demand (7d)</p>
+                    <p className="stat-value">{overview.unmetDemandCount7d}</p>
                   </div>
                 </div>
               </div>
@@ -1867,11 +1964,27 @@ function App() {
                     >
                       Sanitation Heatmap
                     </button>
+                    <button
+                      onClick={() => setShowUnmetDemandHeatmap(!showUnmetDemandHeatmap)}
+                      style={{
+                        padding: '0.5rem 1rem',
+                        borderRadius: '0.5rem',
+                        fontSize: '0.875rem',
+                        fontWeight: 700,
+                        backgroundColor: showUnmetDemandHeatmap ? '#dc2626' : 'transparent',
+                        color: showUnmetDemandHeatmap ? 'white' : '#94a3b8',
+                        border: 'none',
+                        cursor: 'pointer',
+                        transition: 'all 0.2s'
+                      }}
+                    >
+                      Unmet Demand
+                    </button>
                   </div>
 
                   {showHeatmap && (
-                    <select 
-                      className="form-input" 
+                    <select
+                      className="form-input"
                       style={{ width: '150px', padding: '0.5rem', fontSize: '0.875rem' }}
                       value={heatmapTimeRange}
                       onChange={(e) => setHeatmapTimeRange(e.target.value)}
@@ -1890,6 +2003,8 @@ function App() {
                   activePickups={activePickups}
                   showHeatmap={showHeatmap}
                   heatmapData={heatmapData}
+                  showUnmetDemandHeatmap={showUnmetDemandHeatmap}
+                  unmetDemandData={unmetDemandData}
                 />
               </div>
 

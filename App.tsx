@@ -2601,6 +2601,7 @@ export default function App() {
           setNearbyCollectors(collectors);
           setCheckingCoverage(false);
           if (collectors.length === 0) {
+            logUnmetPickupRequest(userCoords.latitude, userCoords.longitude, COVERAGE_RADIUS_MILES);
             Alert.alert(
               '😔 No Collectors Nearby',
               `There are no collectors within ${COVERAGE_RADIUS_MILES} miles of your location right now.\n\nWant us to notify you when a collector enters your area?`,
@@ -2705,6 +2706,23 @@ export default function App() {
     }
 
   };
+
+  // BC-021: fire-and-forget log for admin demand analytics — every zero-
+  // result nearby-collector search gets recorded here, regardless of
+  // whatever the customer-facing flow does next (alert, retry, etc). Never
+  // throws, never awaited by callers, so it can't affect the existing
+  // booking flow either way.
+  const logUnmetPickupRequest = useCallback((lat: number, lng: number, radiusMiles: number) => {
+    if (!user?.id) return;
+    supabase.from('unmet_pickup_requests').insert({
+      customer_id: user.id,
+      latitude: lat,
+      longitude: lng,
+      radius_searched_miles: radiusMiles,
+    }).then(({ error }) => {
+      if (error) console.error('[UnmetDemand] Failed to log unmet pickup request:', error.message);
+    });
+  }, [user?.id]);
 
   const resetBookingStates = useCallback(() => {
     setCapturedImage(null);
@@ -7624,6 +7642,7 @@ export default function App() {
                             setNearbyCollectors(freshCollectors);
 
                             if (freshCollectors.length === 0) {
+                              logUnmetPickupRequest(userCoords.latitude, userCoords.longitude, COVERAGE_RADIUS_MILES);
                               Alert.alert(
                                 "No Collectors Nearby",
                                 "We couldn't find any collectors online in your area right now. Please try again in a few minutes.",

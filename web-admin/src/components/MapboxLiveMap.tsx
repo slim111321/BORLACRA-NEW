@@ -12,6 +12,12 @@ interface MapboxLiveMapProps {
   activePickups: any[];
   heatmapData?: any[];
   showHeatmap?: boolean;
+  /** BC-021: unmet-demand points (zero-collector-found searches) — a
+   * second, independently toggleable heatmap layer, visually distinct
+   * (red/orange vs the pickup heatmap's blue-to-red ramp) so admins can
+   * tell demand gaps apart from completed-pickup density at a glance. */
+  unmetDemandData?: any[];
+  showUnmetDemandHeatmap?: boolean;
 }
 
 const KASOA_CENTER: [number, number] = [-0.4281, 5.5319];
@@ -50,8 +56,63 @@ function pickupMarkerEl(): HTMLDivElement {
 
 const HEATMAP_SOURCE_ID = 'live-ops-heatmap-src';
 const HEATMAP_LAYER_ID = 'live-ops-heatmap-layer';
+const UNMET_DEMAND_SOURCE_ID = 'unmet-demand-heatmap-src';
+const UNMET_DEMAND_LAYER_ID = 'unmet-demand-heatmap-layer';
 
-const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({ collectorLocations, activePickups, heatmapData = [], showHeatmap = false }) => {
+/** Shared by both heatmap layers — adds/updates a GeoJSON heatmap source+layer, or clears it when `show` is false. */
+function applyHeatmapLayer(
+  map: mapboxgl.Map,
+  sourceId: string,
+  layerId: string,
+  data: any[],
+  show: boolean,
+  colorRamp: (string | number)[],
+) {
+  const existingSource = map.getSource(sourceId) as mapboxgl.GeoJSONSource | undefined;
+  const geojson: GeoJSON.FeatureCollection = {
+    type: 'FeatureCollection',
+    features: (show ? data : [])
+      .filter((p) => typeof p.latitude === 'number' && typeof p.longitude === 'number')
+      .map((p) => ({
+        type: 'Feature',
+        properties: { intensity: p.intensity ?? 0.5 },
+        geometry: { type: 'Point', coordinates: [p.longitude, p.latitude] },
+      })),
+  };
+
+  if (existingSource) {
+    existingSource.setData(geojson);
+    return;
+  }
+
+  if (!show || data.length === 0) return;
+
+  map.addSource(sourceId, { type: 'geojson', data: geojson });
+  map.addLayer({
+    id: layerId,
+    type: 'heatmap',
+    source: sourceId,
+    paint: {
+      'heatmap-weight': ['get', 'intensity'],
+      'heatmap-intensity': 1,
+      'heatmap-radius': 25,
+      'heatmap-opacity': 0.8,
+      'heatmap-color': ['interpolate', ['linear'], ['heatmap-density'], ...colorRamp],
+    },
+  });
+}
+
+const PICKUP_COLOR_RAMP = [0.4, 'blue', 0.6, 'cyan', 0.7, 'lime', 0.8, 'yellow', 1, 'red'];
+const UNMET_DEMAND_COLOR_RAMP = [0.3, 'rgba(251,191,36,0)', 0.5, '#fbbf24', 0.75, '#f97316', 1, '#dc2626'];
+
+const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({
+  collectorLocations,
+  activePickups,
+  heatmapData = [],
+  showHeatmap = false,
+  unmetDemandData = [],
+  showUnmetDemandHeatmap = false,
+}) => {
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const styleLoadedRef = useRef(false);
   const markersRef = useRef<{ [key: string]: mapboxgl.Marker }>({});
@@ -153,68 +214,26 @@ const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({ collectorLocations, activ
     });
   }, [activePickups]);
 
-  // Update heatmap layer — mapbox-gl has a native 'heatmap' layer type, no
-  // separate plugin needed (Leaflet's LiveMap relies on the leaflet.heat
-  // plugin for this).
+  // Update pickup-density heatmap layer — mapbox-gl has a native 'heatmap'
+  // layer type, no separate plugin needed (Leaflet's LiveMap relies on the
+  // leaflet.heat plugin for this).
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
-
-    const applyHeatmap = () => {
-      const existingSource = map.getSource(HEATMAP_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
-      const geojson: GeoJSON.FeatureCollection = {
-        type: 'FeatureCollection',
-        features: (showHeatmap ? heatmapData : [])
-          .filter((p) => typeof p.latitude === 'number' && typeof p.longitude === 'number')
-          .map((p) => ({
-            type: 'Feature',
-            properties: { intensity: p.intensity ?? 0.5 },
-            geometry: { type: 'Point', coordinates: [p.longitude, p.latitude] },
-          })),
-      };
-
-      if (existingSource) {
-        existingSource.setData(geojson);
-        return;
-      }
-
-      if (!showHeatmap || heatmapData.length === 0) return;
-
-      map.addSource(HEATMAP_SOURCE_ID, { type: 'geojson', data: geojson });
-      map.addLayer({
-        id: HEATMAP_LAYER_ID,
-        type: 'heatmap',
-        source: HEATMAP_SOURCE_ID,
-        paint: {
-          'heatmap-weight': ['get', 'intensity'],
-          'heatmap-intensity': 1,
-          'heatmap-radius': 25,
-          'heatmap-opacity': 0.8,
-          'heatmap-color': [
-            'interpolate',
-            ['linear'],
-            ['heatmap-density'],
-            0.4,
-            'blue',
-            0.6,
-            'cyan',
-            0.7,
-            'lime',
-            0.8,
-            'yellow',
-            1,
-            'red',
-          ],
-        },
-      });
-    };
-
-    if (styleLoadedRef.current) {
-      applyHeatmap();
-    } else {
-      map.once('load', applyHeatmap);
-    }
+    const apply = () => applyHeatmapLayer(map, HEATMAP_SOURCE_ID, HEATMAP_LAYER_ID, heatmapData, showHeatmap, PICKUP_COLOR_RAMP);
+    if (styleLoadedRef.current) apply();
+    else map.once('load', apply);
   }, [heatmapData, showHeatmap]);
+
+  // Update unmet-demand heatmap layer (BC-021) — independent toggle/source
+  // from the pickup-density layer above, distinct color ramp.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => applyHeatmapLayer(map, UNMET_DEMAND_SOURCE_ID, UNMET_DEMAND_LAYER_ID, unmetDemandData, showUnmetDemandHeatmap, UNMET_DEMAND_COLOR_RAMP);
+    if (styleLoadedRef.current) apply();
+    else map.once('load', apply);
+  }, [unmetDemandData, showUnmetDemandHeatmap]);
 
   if (tokenMissing) {
     return (

@@ -8,6 +8,12 @@ interface LiveMapProps {
   activePickups: any[];
   heatmapData?: any[];
   showHeatmap?: boolean;
+  // BC-021: accepted for prop-shape parity with MapboxLiveMap (App.tsx
+  // picks whichever of the two is active and passes the same props to
+  // either) but intentionally unused here — the unmet-demand heatmap layer
+  // is Mapbox-only per the feature request; this Leaflet map is unaffected.
+  unmetDemandData?: any[];
+  showUnmetDemandHeatmap?: boolean;
 }
 
 declare global {
