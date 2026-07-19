@@ -18,6 +18,13 @@ export const STANDARD_BIN_VOLUME_LITERS = 240;
 export const STANDARD_BIN_PRICE_GHS = 40; // GHS to empty one completely full standard bin
 
 const PROVIDER_TIMEOUT_MS = 25000; // each provider attempt gets 25s before we move to the next one
+// NVIDIA's community NIM endpoint (integrate.api.nvidia.com) measured
+// consistently at 90-150+ seconds per request for this model+prompt in
+// live testing — the 25s default was aborting it on every single real
+// request, long before it ever had a chance to respond. It's no longer the
+// first provider tried (see analyzeTrashImage), so a longer timeout here
+// only costs time on the rarer path where Groq has already failed.
+const NVIDIA_TIMEOUT_MS = 60000;
 
 /**
  * fetch with a hard timeout. Without this, a slow/unresponsive provider
@@ -81,32 +88,37 @@ Be realistic and precise, not conservative -- most real waste photos should not 
 `;
 
 /**
- * Main entry point: tries NVIDIA (Mistral Medium 3.5 128B) first, then
- * Claude, then Groq, then a hardcoded smart-mock estimate.
+ * Main entry point: tries Groq (Qwen3.6 27B) first, then NVIDIA (Mistral
+ * Medium 3.5 128B), then Claude, then a hardcoded smart-mock estimate.
  *
- * NVIDIA is first because it's the provider with a working key right now.
- * Claude is kept in place (not removed) for when a real Anthropic key is
- * added — analyzeWithClaude() throws immediately on a missing key, so it
- * costs nothing to leave it in the chain; it just falls through to Groq
- * until then. (This file previously tried Gemini first — replaced because
- * the free-tier Gemini key in use was unreliable.)
+ * Groq is first because it's the fastest, most reliable working provider
+ * right now (~1-2s, verified live). NVIDIA used to be first, but its
+ * community NIM endpoint measured at 90-150+ seconds per request in live
+ * testing — every real request was hitting the timeout and silently
+ * falling through, which is why "AI providers failed" (the mock estimate)
+ * was showing up on every single photo, not just occasionally. NVIDIA is
+ * kept in the chain (not removed) as a fallback, just no longer gating the
+ * primary experience on its current latency. Claude is kept in place for
+ * when a real Anthropic key is added — analyzeWithClaude() throws
+ * immediately on a missing key, so it costs nothing to leave it in the
+ * chain.
  */
 export async function analyzeTrashImage(base64Image: string): Promise<TrashEstimate> {
   try {
-    console.log('[AI] Attempting analysis with NVIDIA (Mistral Medium 3.5)...');
-    const result = await analyzeWithNvidia(base64Image);
-    return { ...result, provider: 'nvidia' };
-  } catch (nvidiaError: any) {
-    console.warn('[AI] NVIDIA failed, falling back to Claude:', nvidiaError?.message || nvidiaError);
+    console.log('[AI] Attempting analysis with Groq (Qwen3.6 27B)...');
+    const result = await analyzeWithGroq(base64Image);
+    return { ...result, provider: 'groq' };
+  } catch (groqError: any) {
+    console.warn('[AI] Groq failed, falling back to NVIDIA:', groqError?.message || groqError);
     try {
-      const result = await analyzeWithClaude(base64Image);
-      return { ...result, provider: 'claude' };
-    } catch (claudeError: any) {
-      console.warn('[AI] Claude failed, falling back to Groq:', claudeError?.message || claudeError);
+      const result = await analyzeWithNvidia(base64Image);
+      return { ...result, provider: 'nvidia' };
+    } catch (nvidiaError: any) {
+      console.warn('[AI] NVIDIA failed, falling back to Claude:', nvidiaError?.message || nvidiaError);
       try {
-        const result = await analyzeWithGroq(base64Image);
-        return { ...result, provider: 'groq' };
-      } catch (groqError: any) {
+        const result = await analyzeWithClaude(base64Image);
+        return { ...result, provider: 'claude' };
+      } catch (claudeError: any) {
         console.error('[AI] All AI providers failed.');
         console.warn('[AI] Returning smart mock estimate to avoid blocking user.');
 
@@ -159,7 +171,7 @@ async function analyzeWithNvidia(base64Image: string): Promise<Omit<TrashEstimat
       temperature: 0.1,
       max_tokens: 1024,
     }),
-  });
+  }, NVIDIA_TIMEOUT_MS);
 
   if (!res.ok) {
     const errorBody = await res.json().catch(() => null);
@@ -237,9 +249,14 @@ async function analyzeWithGroq(base64Image: string): Promise<Omit<TrashEstimate,
   const apiKey = process.env.EXPO_PUBLIC_GROQ_API_KEY;
   if (!apiKey) throw new Error('Groq API key missing');
 
+  // Both llama-3.2-*-vision-preview models were decommissioned by Groq
+  // (confirmed live: every request returned a hard 400 "model_decommissioned"
+  // error) — meaning Groq, the last real fallback before the hardcoded mock,
+  // was silently guaranteed to fail on every single request. Verified this
+  // replacement live: qwen/qwen3.6-27b is Groq's current vision-capable
+  // model, returns correctly-structured JSON, ~1-2s response time.
   const models = [
-    "llama-3.2-11b-vision-preview",
-    "llama-3.2-90b-vision-preview"
+    "qwen/qwen3.6-27b"
   ];
 
   let lastError: any = null;
