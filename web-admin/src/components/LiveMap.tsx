@@ -119,7 +119,12 @@ const LiveMap: React.FC<LiveMapProps> = ({ collectorLocations, activePickups, he
 
     activePickups.forEach((p) => {
       const id = p.id;
-      const latLng: [number, number] = [p.latitude, p.longitude];
+      // pickups' real columns are lat/lng, not latitude/longitude (see
+      // App.tsx's insert + fetchLiveOpsData/fetchHeatmapData in the parent) —
+      // reading the wrong field silently placed every pickup marker at
+      // Leaflet's NaN fallback instead of its real location.
+      if (typeof p.lat !== 'number' || typeof p.lng !== 'number') return;
+      const latLng: [number, number] = [p.lat, p.lng];
 
       if (!pickupMarkersRef.current[id]) {
         const icon = L.divIcon({

@@ -7,7 +7,6 @@
 // RNMAPBOX_DOWNLOAD_TOKEN must be a Mapbox *secret* (downloads:read scope)
 // token, not the public EXPO_PUBLIC_MAPBOX_TOKEN used at runtime — set it as
 // an EAS secret (see README/EAS build instructions), never commit it here.
-
 module.exports = {
   expo: {
     name: 'Borla',
@@ -38,7 +37,8 @@ module.exports = {
       },
     },
     android: {
-      package: 'com.samsa.native',
+      package: 'com.samsa.borla',
+      googleServicesFile: './google-services.json',
       adaptiveIcon: {
         foregroundImage: './assets/adaptive-icon.png',
         backgroundColor: '#ffffff',

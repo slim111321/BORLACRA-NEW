@@ -95,6 +95,10 @@ const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({ collectorLocations, activ
 
     collectorLocations.forEach((loc) => {
       const id = loc.collector_id;
+      // Defensive: mapboxgl.Marker.setLngLat() throws on non-finite
+      // coordinates (unlike Leaflet, which fails silently) — a row with a
+      // missing/null latitude or longitude would otherwise crash the map.
+      if (typeof loc.latitude !== 'number' || typeof loc.longitude !== 'number') return;
       const lngLat: [number, number] = [loc.longitude, loc.latitude];
       const status = loc.status || 'OFFLINE';
       const color = getMarkerColor(status);
@@ -127,9 +131,14 @@ const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({ collectorLocations, activ
 
     activePickups.forEach((p) => {
       const id = p.id;
+      // pickups' real columns are lat/lng (see App.tsx's insert + fetchHeatmapData's
+      // own mapping below) — not latitude/longitude. Reading the wrong field
+      // name here fed mapboxgl.Marker.setLngLat() undefined/NaN, which throws
+      // "Invalid LngLat object" and used to crash/unmount the whole map.
+      if (typeof p.lat !== 'number' || typeof p.lng !== 'number') return;
       if (!pickupMarkersRef.current[id]) {
         pickupMarkersRef.current[id] = new mapboxgl.Marker({ element: pickupMarkerEl() })
-          .setLngLat([p.longitude, p.latitude])
+          .setLngLat([p.lng, p.lat])
           .setPopup(new mapboxgl.Popup({ offset: 16 }).setHTML(`<b>Pickup:</b> ${p.trash_type}<br/><b>Status:</b> ${p.status}`))
           .addTo(map);
       }
@@ -155,11 +164,13 @@ const MapboxLiveMap: React.FC<MapboxLiveMapProps> = ({ collectorLocations, activ
       const existingSource = map.getSource(HEATMAP_SOURCE_ID) as mapboxgl.GeoJSONSource | undefined;
       const geojson: GeoJSON.FeatureCollection = {
         type: 'FeatureCollection',
-        features: (showHeatmap ? heatmapData : []).map((p) => ({
-          type: 'Feature',
-          properties: { intensity: p.intensity ?? 0.5 },
-          geometry: { type: 'Point', coordinates: [p.longitude, p.latitude] },
-        })),
+        features: (showHeatmap ? heatmapData : [])
+          .filter((p) => typeof p.latitude === 'number' && typeof p.longitude === 'number')
+          .map((p) => ({
+            type: 'Feature',
+            properties: { intensity: p.intensity ?? 0.5 },
+            geometry: { type: 'Point', coordinates: [p.longitude, p.latitude] },
+          })),
       };
 
       if (existingSource) {
