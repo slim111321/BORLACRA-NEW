@@ -213,6 +213,131 @@ See `../SCHEMA_NOTES.md` for schema/RLS notes gathered from a real
   **Rollback**: `supabase/rollback/20260719000000_unmet_pickup_requests_DOWN.sql`
   — drops the table entirely.
 
+- `20260721000000_ai_proxy_rate_limit.sql` — per-user daily quota table
+  (`ai_proxy_requests`) and `check_and_log_ai_proxy_request()` RPC backing
+  the new `ai-trash-estimate`/`voice-transcribe` edge functions (see
+  `supabase/functions/`), which replaced client-side calls to
+  NVIDIA/Groq/Anthropic/Gemini that shipped those provider API keys inside
+  the compiled app. RLS enabled with no client grants at all — only
+  `service_role` can call the RPC. Advisory-locked per (user, endpoint) to
+  close a race where concurrent requests could all pass the quota check
+  before any of them committed. **Applied to the live `samasama` project**
+  via `supabase db push`.
+
+  **Rollback**: `supabase/rollback/20260721000000_ai_proxy_rate_limit_DOWN.sql`
+  — drops the function and table.
+
+- `20260721010000_profiles_and_payout_self_service_hardening.sql` — found
+  during a production-readiness audit re-verification pass (a real
+  `supabase db dump --schema public` pulled directly against the live
+  project). Two live gaps:
+
+  1. **Critical**: `profiles_update_own`/`profiles_update_v2` let any user
+     update their own row with zero column restriction — no trigger existed
+     at all, unlike `pickups` (BC-018). Any authenticated user could PATCH
+     their own row directly via the REST API and set `role='ADMIN'`,
+     `is_verified=true`, or `wallet_balance`/`onboarding_completed`/
+     `status`/`borla_points`/`loyalty_points` to anything. Fixed with a
+     trigger blocking the row owner from touching those specific columns
+     (blocklist, not allowlist, to avoid breaking an untraced legitimate
+     self-edit path); admins and service-role/webhook connections
+     unaffected.
+
+     Non-obvious pitfall hit while building this, worth flagging for
+     whoever touches this trigger next: the function must **not** be
+     `SECURITY DEFINER`. It needs to tell a real client request apart from
+     an internal write issued by a trusted `SECURITY DEFINER` function
+     (`credit_collector_wallet`, called from `handle_pickup_completion`
+     whenever a collector completes their own job) by checking
+     `current_user <> 'postgres'` (every `SECURITY DEFINER` function in
+     this schema is owned by `postgres`). If this function were itself
+     `SECURITY DEFINER`, `current_user` reads as `postgres` unconditionally
+     inside it regardless of the real caller, silently turning the whole
+     check into a no-op. Caught this live in local testing: with that
+     mistake in place, every job completion failed with "You cannot change
+     your own wallet balance" because the collector completing their own
+     job is also the `auth.uid()` being credited.
+
+     **Deliberately not fixed here**: `profiles` is also fully
+     world-readable (two `SELECT` policies are bare `USING(true)` with no
+     `TO` restriction, neutralizing the one correctly-scoped read policy —
+     the same class of bug BC-019 found on `pickups`). Anyone holding just
+     the public anon key can read every user's phone number, live GPS,
+     wallet balance, and KYC document URLs, no login required. Left as a
+     separate follow-up: fixing it safely requires tracing which fields
+     `App.tsx`/`web-admin` legitimately read cross-user first.
+
+  2. **Medium**: `payout_requests_manage_verified` had no `FOR` clause, so
+     it applied to `UPDATE`/`DELETE` as well as `SELECT`/`INSERT` — a
+     verified collector could directly set their own request's `status` to
+     `'PAID'`/`'REJECTED'`, bypassing the admin-only `process_payout()` RPC.
+     No direct money movement was possible (nothing triggers off this
+     table directly), but it let a collector fabricate records or edit
+     `amount`/`admin_notes` on their own request. Split into four
+     command-scoped policies matching real app usage (collectors only ever
+     `INSERT`; admins are the only ones who ever `UPDATE`, confirmed via
+     `App.tsx`/`web-admin/src/App.tsx`).
+
+  Both tested against a local Postgres fixture loaded from a real
+  `supabase db dump --schema public` (not a hand-reconstructed
+  approximation) before being applied live — 20 assertions, see
+  `scripts/verify/critical-rls-local-db-test.sql` and the setup steps
+  documented at the top of that file. **Applied to the live `samasama`
+  project** via `supabase db push`, confirmed via a post-push
+  `supabase db dump` showing the new trigger and policies in place.
+
+  **Rollback**: `supabase/rollback/20260721010000_profiles_and_payout_self_service_hardening_DOWN.sql`
+  — restores the original (vulnerable) state exactly; only use this if the
+  forward migration itself caused a regression that needs to be backed out
+  immediately, not as a way to re-open these gaps.
+
+- `20260721020000_profiles_read_exposure_fix.sql` — companion to the
+  migration above, found in the same re-verification pass but scoped
+  separately since it's a bigger change (RLS policy design + ~12 App.tsx
+  call sites, not just a trigger). `profiles` had two SELECT policies that
+  were bare `USING(true)` with no `TO` restriction, neutralizing the one
+  correctly-scoped policy — anyone holding just the public anon key could
+  read every user's phone number, live GPS, wallet balance, and KYC
+  document URLs (`vehicle_details.kyc_docs`/`photo_url`), no login
+  required. Dropped both loose policies (only `profiles_read_own_or_admin`
+  — self or `is_admin()` — remains); added a `profiles_public` view
+  exposing only `id, full_name, phone_number, avatar_url, role,
+  loyalty_points, vehicle_type, vehicle_number, vehicle_details (kyc_docs/
+  photo_url stripped), push_token` for the app's real cross-user use cases
+  (a customer seeing their assigned collector's name/photo/vehicle info,
+  contact numbers, the loyalty leaderboard), granted to `authenticated`
+  only. Every cross-user `.from('profiles')` read site in `App.tsx` was
+  traced and redirected to `.from('profiles_public')` (~12 sites); the two
+  PostgREST FK-embed sites (`profiles!customer_id(...)` etc.) were left
+  untouched since the app already had graceful per-row fallback logic that
+  now correctly uses the view. `web-admin`'s User Management dashboard
+  needed no changes — it always operates as a real `ADMIN` session, so
+  `is_admin()` already covers full-row access with no code changes.
+  `push_token` stays in the view only until push sending moves server-side
+  (tracked separately, see `PROJECT_STATE.md`) — App.tsx currently reads
+  another party's token client-side to call `sendPushNotification`
+  directly, so removing it here would break real notification delivery.
+  Also noted, not fixed: several `App.tsx` call sites reference a
+  `profiles.rating_average` column that does not exist on the live table
+  (confirmed via the same `supabase db dump`) — a pre-existing, unrelated
+  bug, left alone.
+
+  Tested against the same local Postgres fixture as the migration above —
+  6 assertions in `scripts/verify/critical-profiles-read-exposure-local-db-test.sql`
+  (unrelated user blocked from a direct full-row read; `profiles_public`
+  exposes the safe fields and strips `kyc_docs`/`photo_url` while keeping
+  other `vehicle_details` keys; `profiles_public` has no `wallet_balance`
+  column at all; self-read of the full row, including `wallet_balance`,
+  still works) — plus a full re-run of
+  `scripts/verify/critical-rls-local-db-test.sql` (all 20 assertions still
+  pass) to confirm this migration didn't regress the one before it.
+  **Applied to the live `samasama` project** via `supabase db push`.
+
+  **Rollback**: `supabase/rollback/20260721020000_profiles_read_exposure_fix_DOWN.sql`
+  — restores the original (world-readable) policies and drops the view;
+  only use this if the forward migration caused a regression, not as a way
+  to re-open this hole.
+
 ## Migration standards (established here, as the first migration in this project)
 
 Since this repository had no prior migrations to follow a convention from,

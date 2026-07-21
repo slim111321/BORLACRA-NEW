@@ -1,7 +1,0 @@
-{
-  "name": "Uber Redesign Concept",
-  "description": "A high-fidelity replication of an Uber UI concept featuring a clean, modern aesthetic with Raleway and Rubik typography, smooth transitions, and a comprehensive ride-booking flow.",
-  "requestFramePermissions": [
-    "geolocation"
-  ]
-}

@@ -1,0 +1,101 @@
+name: CI
+
+# Runs the existing scripts/verify/* regression checks, lint, and a real
+# typecheck/build on every push to master and every PR, for both the
+# mobile app (root) and web-admin (its own separate npm project). Neither
+# job needs real Supabase/provider credentials -- lint/typecheck/build
+# never execute the app, they only parse and bundle it.
+#
+# Not included here: scripts/verify/critical-rls-local-db-test.sql and
+# critical-profiles-read-exposure-local-db-test.sql (the real-schema RLS
+# regression suite added this session). Those need the live project's full
+# schema loaded into a local Postgres first (see the setup steps at the top
+# of each file) -- this repo's own migrations can't bootstrap a database
+# from scratch (the base CREATE TABLE statements predate migration
+# tracking and only exist live, see supabase/migrations/README.md), and
+# giving CI direct production database credentials just to dump a schema
+# on every run is its own risk not worth taking for this pass. Running
+# those two suites is still a manual step before/after a migration change,
+# same as this session did it. Revisit once a committed "base schema"
+# migration exists.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mobile:
+    name: Mobile app — verify, lint, typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Syntax check
+        run: node scripts/verify/check-syntax.js
+
+      - name: No auth bypass
+        run: node scripts/verify/check-no-auth-bypass.js
+
+      - name: No committed secrets
+        run: node scripts/verify/check-no-committed-secrets.js
+
+      - name: Push token wired
+        run: node scripts/verify/check-push-token-wired.js
+
+      - name: Admin notification permission
+        run: node scripts/verify/check-admin-notification-permission.js
+
+      - name: AI estimator proxy contract
+        run: node scripts/verify/check-ai-estimator.js
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit -p tsconfig.json
+
+  web-admin:
+    name: web-admin — lint, build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web-admin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web-admin/package-lock.json
+
+      - run: npm ci
+
+      # Non-blocking on purpose: web-admin's eslint config (React Compiler
+      # rules + no-explicit-any as an error) currently reports 91 real
+      # pre-existing errors across the codebase, unrelated to any change in
+      # this session -- confirmed by running it locally before adding this
+      # workflow. Silently loosening the config to force a false-green
+      # would hide real signal (a few of the flagged issues, e.g. "Calling
+      # setState synchronously within an effect", look like genuine bugs
+      # worth a dedicated look); blocking every future PR on fixing all 91
+      # right now is its own separate, much larger task. Still runs and
+      # surfaces in the Actions log/annotations either way.
+      - name: Lint (non-blocking — see comment above)
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Build (tsc -b && vite build)
+        run: npm run build

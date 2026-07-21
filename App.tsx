@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import * as Sentry from '@sentry/react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import {
@@ -55,6 +56,23 @@ import {
 } from './utils/location';
 
 const COVERAGE_RADIUS_MILES = 3; // Reduced from 10 to 3 for a stricter local search radius
+
+// Paystack public key: __DEV__ is true in Expo Go / dev client and false in
+// a real release build (same convention already used by lib/sentry.ts for
+// its environment tag) — so a local `expo start` session always uses the
+// sandbox key and only a real production build ever uses the live key.
+// Previously this was hardcoded to always use the test key (with a
+// committed test-key literal as a fallback), which meant real customer
+// payments were never actually being charged even in production.
+const PAYSTACK_PUBLIC_KEY = __DEV__
+  ? process.env.EXPO_PUBLIC_PAYSTACK_TEST_KEY
+  : process.env.EXPO_PUBLIC_PAYSTACK_KEY;
+
+if (!PAYSTACK_PUBLIC_KEY) {
+  console.error(
+    `[Paystack] Missing ${__DEV__ ? 'EXPO_PUBLIC_PAYSTACK_TEST_KEY' : 'EXPO_PUBLIC_PAYSTACK_KEY'} — payments will fail until it is set (see .env.local.example).`
+  );
+}
 
 import {
   LOCATION_UPDATE_INTERVAL_MS,
@@ -331,6 +349,7 @@ export default function App() {
       const { data: { publicUrl } } = supabase.storage.from(bucket).getPublicUrl(path);
       return publicUrl;
     } catch (err) {
+      Sentry.captureException(err);
       console.error('Upload error:', err);
       Alert.alert('Upload Failed', 'Could not upload image. Please try again.');
       return null;
@@ -350,6 +369,7 @@ export default function App() {
       const results = await activeMapProvider.geocode(query);
       setLocationSearchResults(results);
     } catch (e) {
+      Sentry.captureException(e);
       console.error('[maps] geocode search error:', e);
       setLocationSearchResults([]);
     } finally {
@@ -459,6 +479,7 @@ export default function App() {
           playThroughEarpieceAndroid: false,
         });
       } catch (err) {
+        Sentry.captureException(err, { level: 'warning' });
         console.warn('[Audio] Failed to init audio session:', err);
       }
     };
@@ -636,6 +657,7 @@ export default function App() {
       if (error) throw error;
       setChatMessages(data || []);
     } catch (err) {
+      Sentry.captureException(err);
       console.error('[Chat] Fetch error:', err);
     }
   };
@@ -670,19 +692,18 @@ export default function App() {
 
       if (error) throw error;
 
-      // Send Push Notification to the other party
+      // Send Push Notification to the other party -- the edge function
+      // resolves their push token itself server-side.
       const otherUserId = role === UserRole.CUSTOMER ? activePickup.collector_id : (activePickup.customer_id || activePickup.user_id);
       if (otherUserId) {
-        const { data: otherProfile } = await supabase.from('profiles').select('push_token').eq('id', otherUserId).single();
-        if (otherProfile?.push_token) {
-          sendPushNotification(
-            otherProfile.push_token,
-            `New message from ${userProfile?.full_name || 'User'}`,
-            content.length > 50 ? content.substring(0, 47) + '...' : content
-          );
-        }
+        sendPushNotification(
+          otherUserId,
+          `New message from ${userProfile?.full_name || 'User'}`,
+          content.length > 50 ? content.substring(0, 47) + '...' : content
+        );
       }
     } catch (err) {
+      Sentry.captureException(err);
       console.error('[Chat] Send error:', err);
       // Remove optimistic message on error
       setChatMessages(prev => prev.filter(m => m.id !== tempId));
@@ -742,7 +763,7 @@ export default function App() {
         const processedData = await Promise.all(resultData.map(async (p) => {
           const enriched = { ...p };
           if (enriched.collector_id && !enriched.collector) {
-            const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', enriched.collector_id).maybeSingle();
+            const { data: col, error: colErr } = await supabase.from('profiles_public').select('*').eq('id', enriched.collector_id).maybeSingle();
             if (colErr) console.error('[History] Collector profile fetch error:', colErr);
             if (col) {
               const vDetails = typeof col.vehicle_details === 'string' ? JSON.parse(col.vehicle_details) : (col.vehicle_details || null);
@@ -750,12 +771,12 @@ export default function App() {
             }
           }
           if (enriched.customer_id && !enriched.customer) {
-            const { data: cust, error: custErr } = await supabase.from('profiles').select('*').eq('id', enriched.customer_id).maybeSingle();
+            const { data: cust, error: custErr } = await supabase.from('profiles_public').select('*').eq('id', enriched.customer_id).maybeSingle();
             if (custErr) console.error('[History] Customer profile fetch error:', custErr);
             if (cust) enriched.customer = cust;
           }
           if (activePickup && activePickup.id === enriched.id && enriched.collector) {
-            setActivePickup(prev => prev ? ({ ...prev, ...enriched, collector: enriched.collector }) : null);
+            setActivePickup((prev: any) => prev ? ({ ...prev, ...enriched, collector: enriched.collector }) : null);
           }
           return enriched;
         }));
@@ -769,8 +790,13 @@ export default function App() {
           ));
           setPickups(processedData.filter(p => p.status !== 'pending' && p.collector_id === authUser.id));
         }
+      } else {
+        console.error('[History] Failed to fetch pickups after fallback:', resultError);
+        Sentry.captureException(resultError);
+        if (!silent) Alert.alert('Connection Error', 'Could not load your pickups. Pull to refresh or try again shortly.');
       }
     } catch (err) {
+      Sentry.captureException(err);
       console.error('[History] Unexpected error:', err);
     } finally {
       if (!silent) setIsHistoryLoading(false);
@@ -840,6 +866,7 @@ export default function App() {
         if (status.isLoaded && status.didJustFinish) sound.unloadAsync();
       });
     } catch (e) {
+      Sentry.captureException(e, { level: 'warning' });
       console.warn('[Audio] Ping setup failed:', e);
     }
   };
@@ -866,7 +893,7 @@ export default function App() {
           if (payload.eventType === 'UPDATE') {
             const updated = payload.new;
             if (activePickup && updated.id === activePickup.id) {
-              setActivePickup(prev => ({ ...prev, ...updated }));
+              setActivePickup((prev: any) => ({ ...prev, ...updated }));
               if (updated.status === 'collected') setJobStatus('collected');
               if (updated.status === 'completed') {
                 setJobStatus('completed');
@@ -901,7 +928,7 @@ export default function App() {
               );
 
               if (dist <= COVERAGE_RADIUS_MILES && !dismissedIdsRef.current.includes(payload.new.id)) {
-                supabase.from('profiles').select('full_name, avatar_url').eq('id', payload.new.customer_id).single()
+                supabase.from('profiles_public').select('full_name, avatar_url').eq('id', payload.new.customer_id).single()
                   .then(({ data: cust }) => {
                     const enriched = { ...payload.new, customer: cust };
                     setNewRequestOverlay(enriched);
@@ -914,7 +941,7 @@ export default function App() {
           // CUSTOMER LOGIC
           if (role === UserRole.CUSTOMER) {
              if (payload.new.status === 'assigned' && (payload.new.customer_id === user.id || payload.new.user_id === user.id)) {
-                supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', payload.new.collector_id).single()
+                supabase.from('profiles_public').select('full_name, avatar_url, vehicle_details, vehicle_number, vehicle_type').eq('id', payload.new.collector_id).single()
                   .then(({ data: coll }) => {
                     const vDetails = typeof coll?.vehicle_details === 'string' ? JSON.parse(coll.vehicle_details) : (coll?.vehicle_details || null);
                     const enrichedColl = coll ? { ...coll, vehicle_details: vDetails } : null;
@@ -925,7 +952,7 @@ export default function App() {
                   });
              }
              if (payload.new.status === 'collected' && (payload.new.customer_id === user.id || payload.new.user_id === user.id)) {
-                setActivePickup(prev => ({ ...prev, ...payload.new, collector: prev?.collector }));
+                setActivePickup((prev: any) => ({ ...prev, ...payload.new, collector: prev?.collector }));
                 setStep(AppStep.PAYMENT);
                 playPing();
              }
@@ -937,7 +964,7 @@ export default function App() {
         { event: 'location' },
         (payload) => {
           if (role === UserRole.CUSTOMER && activePickup) {
-            setActivePickup(prev => prev ? ({
+            setActivePickup((prev: any) => prev ? ({
               ...prev,
               lat: payload.payload.lat,
               lng: payload.payload.lng
@@ -1167,6 +1194,12 @@ export default function App() {
           .order('created_at', { ascending: false })
           .limit(1);
 
+        if (error) {
+          console.error('[Support] Failed to check for an existing open ticket:', error);
+          Sentry.captureException(error);
+          return;
+        }
+
         if (tickets && tickets.length > 0) {
           setActiveTicket(tickets[0]);
         } else {
@@ -1198,9 +1231,12 @@ export default function App() {
             });
           } else {
             console.error('Failed to automatically create a support ticket:', createError);
+            Sentry.captureException(createError);
+            Alert.alert('Chat Unavailable', 'Could not start a support chat right now. Please try again shortly.');
           }
         }
       } catch (err) {
+        Sentry.captureException(err);
         console.error('Error ensuring active support ticket:', err);
       }
     };
@@ -1374,7 +1410,7 @@ export default function App() {
 
         if (pickup && pickup.collector_id) {
           console.log('[Sync] Aggressive polling fetched pickup. Fetching profile directly for collector_id:', pickup.collector_id);
-          const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', pickup.collector_id).maybeSingle();
+          const { data: col, error: colErr } = await supabase.from('profiles_public').select('*').eq('id', pickup.collector_id).maybeSingle();
           if (colErr) console.error('[Sync] Aggressive polling profile fetch error:', colErr);
           let collObj = col || null;
           if (collObj) {
@@ -1412,7 +1448,7 @@ export default function App() {
             setStep(AppStep.COLLECTOR_FOUND);
             playPing();
           } else if (pickup.collector_id) {
-            const { data: col } = await supabase.from('profiles').select('full_name, avatar_url, rating_average, vehicle_details, vehicle_number, vehicle_type').eq('id', pickup.collector_id).maybeSingle();
+            const { data: col } = await supabase.from('profiles_public').select('full_name, avatar_url, vehicle_details, vehicle_number, vehicle_type').eq('id', pickup.collector_id).maybeSingle();
             setActivePickup({ ...pickup, collector: col || null });
             setStep(AppStep.COLLECTOR_FOUND);
             playPing();
@@ -1469,6 +1505,7 @@ export default function App() {
       
       if (status) setTruckLoad(status.current_load_pct);
     } catch (err) {
+      Sentry.captureException(err);
       console.error('fetchCollectorStats error:', err);
     }
   }, [user?.id]);
@@ -1485,6 +1522,7 @@ export default function App() {
         setCollectorMetric(data);
       }
     } catch (e) {
+      Sentry.captureException(e);
       console.error('fetchCollectorMetric failed:', e);
     }
   }, [user?.id]);
@@ -1503,6 +1541,7 @@ export default function App() {
         setCollectorReviews(data);
       }
     } catch (e) {
+      Sentry.captureException(e);
       console.error('fetchCollectorReviews failed:', e);
     }
   }, [user?.id]);
@@ -1515,6 +1554,7 @@ export default function App() {
         setLandfills(data);
       }
     } catch (e) {
+      Sentry.captureException(e);
       console.error('fetchLandfills failed:', e);
     }
   }, []);
@@ -1535,6 +1575,7 @@ export default function App() {
         .order('created_at', { ascending: false });
       if (!error && data) setRecurringRoutes(data);
     } catch (e) {
+      Sentry.captureException(e);
       console.error('fetchRecurringRoutes failed:', e);
     } finally {
       setIsLoadingRecurringRoutes(false);
@@ -1573,6 +1614,7 @@ export default function App() {
       setLoyaltyPoints(newBalance);
       Alert.alert('Voucher Activated 🎉', `Show this code to the GOIL attendant:\n\n${voucherCode}\n\n${GOIL_VOUCHER_POINTS_COST} points were deducted from your balance.`);
     } catch (e: any) {
+      Sentry.captureException(e);
       Alert.alert('Error', 'Could not activate voucher: ' + e.message);
     } finally {
       setIsRedeemingVoucher(false);
@@ -1602,6 +1644,7 @@ export default function App() {
         console.error('fetchCollectorWallet: wallet_transactions fetch failed:', txError);
       }
     } catch (e) {
+      Sentry.captureException(e);
       console.error('fetchCollectorWallet failed:', e);
     }
   }, [user?.id]);
@@ -1610,17 +1653,19 @@ export default function App() {
   const updateCollectorStatus = useCallback(async (status: CollectorStatus) => {
     if (role !== UserRole.COLLECTOR || !user?.id) return;
     try {
-      await supabase.from('collector_status').upsert({
+      const { error: statusError } = await supabase.from('collector_status').upsert({
         collector_id: user.id,
         status: status,
         last_updated: new Date().toISOString()
       }, { onConflict: 'collector_id' });
+      if (statusError) throw statusError;
 
       // Mirror status to collector_locations for instant realtime map updates
-      await supabase.from('collector_locations').update({
+      const { error: locError } = await supabase.from('collector_locations').update({
         status: status
       }).eq('collector_id', user.id);
-      
+      if (locError) throw locError;
+
       setUserProfile((prev: any) => ({ ...prev, collector_status: status }));
       console.log(`[Status] Collector is now ${status}`);
       
@@ -1632,6 +1677,7 @@ export default function App() {
       );
 
     } catch (err) {
+      Sentry.captureException(err);
       console.error('[Status] Update error:', err);
     }
   }, [user?.id, role]);
@@ -1643,12 +1689,13 @@ export default function App() {
     setTruckLoad(value);
     
     try {
-      await supabase.from('collector_status').upsert({
+      const { error: loadError } = await supabase.from('collector_status').upsert({
         collector_id: user.id,
         current_load_pct: value,
         last_updated: new Date().toISOString()
       });
-      
+      if (loadError) throw loadError;
+
       if (value >= 90) {
         Alert.alert(
           "🚨 Truck Almost Full!",
@@ -1672,6 +1719,7 @@ export default function App() {
         );
       }
     } catch (err) {
+      Sentry.captureException(err);
       console.error('updateTruckLoad error:', err);
     }
   };
@@ -1685,6 +1733,7 @@ export default function App() {
       if (buyers) setScrapBuyers(buyers);
       if (listings) setMyScrapListings(listings);
     } catch (err) {
+      Sentry.captureException(err);
       console.error('fetchScrapData error:', err);
     }
   }, [user?.id]);
@@ -1746,6 +1795,7 @@ export default function App() {
 
       setCommunityPools(enrichedPools);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Community pools fetch error:", err);
     }
   }, []);
@@ -1788,7 +1838,7 @@ export default function App() {
   // "Leaderboard loading..." no matter what.
   const fetchTopPerformers = useCallback(async () => {
     const { data, error } = await supabase
-      .from('profiles')
+      .from('profiles_public')
       .select('id, full_name, loyalty_points')
       .eq('role', 'COLLECTOR')
       .order('loyalty_points', { ascending: false })
@@ -1812,16 +1862,18 @@ export default function App() {
 
       if (error) throw error;
       if (data) {
-        await supabase.from('convoy_members').insert({
+        const { error: memberError } = await supabase.from('convoy_members').insert({
           convoy_id: data.id,
           collector_id: user.id
         });
+        if (memberError) throw memberError;
         setCurrentConvoyId(data.id);
         setConvoyActive(true);
         fetchConvoys();
         Alert.alert('Convoy Started', `You have started a new convoy in ${data.zone_name}.`);
       }
     } catch (err: any) {
+      Sentry.captureException(err);
       Alert.alert('Error', err.message || 'Could not start convoy');
     } finally {
       setIsConvoyActionLoading(false);
@@ -1845,6 +1897,7 @@ export default function App() {
       fetchConvoys();
       Alert.alert('Joined', `You have joined the ${zoneName} convoy.`);
     } catch (err: any) {
+      Sentry.captureException(err);
       Alert.alert('Error', err.message || 'Could not join convoy');
     } finally {
       setIsConvoyActionLoading(false);
@@ -1876,6 +1929,7 @@ export default function App() {
       // also kick the collector off the screen.
       if (navigateAway) setStep(AppStep.COLLECTOR_DASHBOARD);
     } catch (err) {
+      Sentry.captureException(err);
       console.error(err);
     } finally {
       setIsConvoyActionLoading(false);
@@ -1902,18 +1956,16 @@ export default function App() {
 
       let count = 0;
       for (const col of otherCollectors) {
-        const { data: prof } = await supabase.from('profiles').select('push_token').eq('id', col.collector_id).single();
-        if (prof?.push_token) {
-          await sendPushNotification(
-            prof.push_token,
-            '🤝 Convoy Invitation',
-            `${userProfile?.full_name || 'A collector'} invited you to join a convoy in ${locationLabel || 'your area'}.`
-          );
-          count++;
-        }
+        await sendPushNotification(
+          col.collector_id,
+          '🤝 Convoy Invitation',
+          `${userProfile?.full_name || 'A collector'} invited you to join a convoy in ${locationLabel || 'your area'}.`
+        );
+        count++;
       }
       Alert.alert('Invites Sent', `Sent convoy invitations to ${count} collectors nearby.`);
     } catch (err) {
+      Sentry.captureException(err);
       console.error(err);
     } finally {
       setIsConvoyActionLoading(false);
@@ -1945,12 +1997,20 @@ export default function App() {
 
   const handleSignOut = async () => {
     try {
-      await supabase.auth.signOut();
+      const { error: signOutError } = await supabase.auth.signOut();
+      // Always proceed to clear local state/redirect even if the server
+      // call itself failed -- the user still expects to be logged out of
+      // the UI, but this is worth knowing about in Sentry.
+      if (signOutError) {
+        console.error('Sign out API error (proceeding with local sign-out anyway):', signOutError);
+        Sentry.captureException(signOutError);
+      }
       setUser(null);
       setUserProfile(null);
       setRole(UserRole.CUSTOMER);
       setStep(AppStep.SPLASH);
     } catch (e) {
+      Sentry.captureException(e);
       console.error('Sign out error:', e);
       // Fallback redirect even if API call fails
       setStep(AppStep.SPLASH);
@@ -2010,6 +2070,7 @@ export default function App() {
       setShowAddSavedLocation(false);
       fetchSavedLocations();
     } catch (e: any) {
+      Sentry.captureException(e);
       Alert.alert('Error', 'Could not save this location: ' + e.message);
     } finally {
       setIsSavingLocation(false);
@@ -2144,6 +2205,7 @@ export default function App() {
             }
           }
         } catch (e: any) {
+          Sentry.captureException(e, { level: 'warning' });
           alert("Error: " + e.message);
         }
       }
@@ -2169,6 +2231,7 @@ export default function App() {
         setProofImage(result.assets[0].uri);
       }
     } catch (e: any) {
+      Sentry.captureException(e);
       Alert.alert('Camera Error', e.message);
     }
   };
@@ -2190,16 +2253,11 @@ export default function App() {
       // Notify the customer that the collector has arrived
       const customerId = activePickup.customer_id || activePickup.user_id;
       if (customerId) {
-        supabase.from('profiles').select('push_token').eq('id', customerId).single()
-          .then(({ data: cust }) => {
-            if (cust?.push_token) {
-              sendPushNotification(
-                cust.push_token,
-                '📍 Your Collector Has Arrived!',
-                `${userProfile?.full_name || 'Your collector'} is at your location. Please come out with your waste!`
-              ).catch(e => console.warn('[Push] Arrival notify failed:', e));
-            }
-          });
+        sendPushNotification(
+          customerId,
+          '📍 Your Collector Has Arrived!',
+          `${userProfile?.full_name || 'Your collector'} is at your location. Please come out with your waste!`
+        ).catch(e => console.warn('[Push] Arrival notify failed:', e));
       }
     }
     setIsArriving(false);
@@ -2239,6 +2297,7 @@ export default function App() {
           console.warn('[Proof] Upload skipped:', uploadError.message);
         }
         } catch (uploadEx) {
+          Sentry.captureException(uploadEx);
           console.warn('[Proof] Upload exception, continuing without photo URL:', uploadEx);
         }
       }
@@ -2250,6 +2309,7 @@ export default function App() {
       if (error) throw error;
       setJobStatus('collected');
     } catch (e: any) {
+      Sentry.captureException(e);
       Alert.alert('Error', 'Could not confirm collection: ' + e.message);
     }
     setIsCollecting(false);
@@ -2360,6 +2420,7 @@ export default function App() {
         }
       );
     } catch (e: any) {
+      Sentry.captureException(e);
       console.error('[Audio] playVoiceNote failed:', e);
       if (onEnd) onEnd();
       Alert.alert('Audio Error', 'The voice note could not be loaded. Please check your internet connection.');
@@ -2457,6 +2518,7 @@ export default function App() {
           console.log('[Voice] Upload successful:', uploadedVoiceUrl, '— bytes uploaded:', audioBuffer.byteLength);
         }
       } catch (e) {
+        Sentry.captureException(e);
         console.error('[Voice] Upload failed:', e);
         Alert.alert('Upload Error', 'We could not upload your voice directions. Please check your connection and try again.');
         setIsRequestingCollection(false);
@@ -2561,6 +2623,11 @@ export default function App() {
         // Fetch or create profile
         try {
           let { data: profile, error: pError } = await supabase.from('profiles').select('*').eq('id', data.user.id).single();
+          // PGRST116 ("no rows") is the expected, normal case for a
+          // brand-new user -- only a genuinely different error (RLS,
+          // network, etc.) should stop this from falling through to
+          // profile creation below.
+          if (pError && pError.code !== 'PGRST116') throw pError;
           if (!profile) {
             // If no profile exists for this phone number, create one with the currently selected role
             const { data: newProfile, error: insError } = await supabase.from('profiles').insert({
@@ -2579,6 +2646,7 @@ export default function App() {
             navigateByRole(profile);
           }
         } catch (e: any) {
+          Sentry.captureException(e);
           alert("Error setting up profile: " + e.message);
         }
       }
@@ -2611,12 +2679,18 @@ export default function App() {
                   text: 'Notify Me', 
                   onPress: async () => {
                     if (!user) return;
-                    await supabase.from('missed_bookings').insert([{
+                    const { error: missedBookingError } = await supabase.from('missed_bookings').insert([{
                       user_id: user.id,
                       latitude: userCoords.latitude,
                       longitude: userCoords.longitude,
                       resolved: false
                     }]);
+                    if (missedBookingError) {
+                      console.error('[MissedBookings] Failed to subscribe:', missedBookingError);
+                      Sentry.captureException(missedBookingError);
+                      Alert.alert('Error', 'Could not save your notification request. Please try again.');
+                      return;
+                    }
                     Alert.alert('Subscribed', 'We will send you a push notification as soon as a collector is available in your area.');
                   }
                 }
@@ -2655,6 +2729,7 @@ export default function App() {
           console.warn("[Location] Geocoding returned no results. Staying with current GPS.");
         }
       } catch (e) {
+        Sentry.captureException(e);
         console.error("[Location] Geocoding error:", e);
       } finally {
         setIsGeocoding(false);
@@ -2894,7 +2969,7 @@ export default function App() {
            const basePickup = simple || payload.new;
            const collectorId = basePickup.collector_id;
            if (collectorId) {
-             const { data: col, error: colErr } = await supabase.from('profiles').select('*').eq('id', collectorId).maybeSingle();
+             const { data: col, error: colErr } = await supabase.from('profiles_public').select('*').eq('id', collectorId).maybeSingle();
              if (colErr) console.error('[Realtime] Listener 2 profile fetch error:', colErr);
              const vDetails = typeof col?.vehicle_details === 'string' ? JSON.parse(col.vehicle_details) : (col?.vehicle_details || null);
              const enrichedColl = col ? { ...col, vehicle_details: vDetails } : null;
@@ -3792,6 +3867,7 @@ export default function App() {
                             recordingRef.current = recording;
                             setIsRecordingLandmark(true);
                           } catch (e) {
+                            Sentry.captureException(e);
                             console.error('Failed to start recording:', e);
                             alert('Could not start recording. Please check microphone permissions.');
                           }
@@ -3815,6 +3891,7 @@ export default function App() {
                             recordingRef.current = null;
                             setIsRecordingLandmark(false);
                           } catch (e) {
+                            Sentry.captureException(e);
                             console.error('Failed to stop recording:', e);
                             setIsRecordingLandmark(false);
                           }
@@ -4107,7 +4184,7 @@ export default function App() {
               <View style={{ width: 32 }} />
             </View>
 
-            <PaystackProvider publicKey={process.env.EXPO_PUBLIC_PAYSTACK_TEST_KEY || 'pk_test_d1970ac19a3e4aa2cc22c1c36bcb57848f7a358f'}>
+            <PaystackProvider publicKey={PAYSTACK_PUBLIC_KEY || ''}>
               <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 100 }}>
                 {activePickup?.proof_photo_url && (
                   <View style={{ marginHorizontal: 20, marginBottom: 20, backgroundColor: '#fff', borderRadius: 16, overflow: 'hidden', borderWidth: 1, borderColor: '#F3F4F6' }}>
@@ -4807,8 +4884,8 @@ export default function App() {
                         // Immediately enrich activePickup with customer info so the collector
                         // sees the customer's name and photo right away (without waiting for fetchHistory)
                         const { data: custProfile } = await supabase
-                          .from('profiles')
-                          .select('full_name, phone_number, avatar_url, push_token')
+                          .from('profiles_public')
+                          .select('full_name, phone_number, avatar_url')
                           .eq('id', activePickup.customer_id || activePickup.user_id)
                           .single();
 
@@ -4819,10 +4896,12 @@ export default function App() {
                           customer: custProfile || prev?.customer,
                         }));
 
-                        // Send push notification to the customer
-                        if (custProfile?.push_token) {
+                        // Send push notification to the customer -- the
+                        // edge function resolves their push token itself.
+                        {
+                          const notifyCustomerId = activePickup.customer_id || activePickup.user_id;
                           sendPushNotification(
-                            custProfile.push_token,
+                            notifyCustomerId,
                             '🚛 Collector On The Way!',
                             `${userProfile?.full_name || 'A collector'} has accepted your pickup request and is heading to you now.`
                           ).catch(e => console.warn('[Push] Accept notify failed:', e));
@@ -5154,6 +5233,7 @@ export default function App() {
                 setNotifBroadcasts(broadcasts || []);
                 setResolvedMissed(missed || []);
               } catch (e) {
+                Sentry.captureException(e, { level: 'warning' });
                 console.warn('[Notifications] Failed to load notifications:', e);
               } finally {
                 setNotifLoading(false);
@@ -5250,6 +5330,8 @@ export default function App() {
                       setActiveTicket(ticket);
                       setStep(AppStep.CHAT);
                     } else {
+                      console.error('[Support] Could not create ticket:', error);
+                      Sentry.captureException(error);
                       Alert.alert('Error', 'Could not open a support ticket. Please try again.');
                     }
                   }}
@@ -5475,7 +5557,13 @@ export default function App() {
                   const url = await uploadToSupabase(uri, 'avatars', `${user?.id}/avatar.jpg`, base64);
                   if (url) {
                     const cacheBustedUrl = `${url}?t=${Date.now()}`;
-                    await supabase.from('profiles').update({ avatar_url: cacheBustedUrl }).eq('id', user?.id);
+                    const { error: avatarError } = await supabase.from('profiles').update({ avatar_url: cacheBustedUrl }).eq('id', user?.id);
+                    if (avatarError) {
+                      console.error('[Profile] Failed to save avatar:', avatarError);
+                      Sentry.captureException(avatarError);
+                      Alert.alert('Error', 'Could not save your new photo. Please try again.');
+                      return;
+                    }
                     setUserProfile((prev: any) => ({ ...prev, avatar_url: cacheBustedUrl }));
                   }
                 })}>
@@ -5632,9 +5720,15 @@ export default function App() {
                   onPress={() => pickImage(async (uri, base64) => {
                     const url = await uploadToSupabase(uri, 'avatars', `${user?.id}/collector_avatar.jpg`, base64);
                     if (url) {
+                      const { error: avatarError } = await supabase.from('profiles').update({ avatar_url: url }).eq('id', user?.id);
+                      if (avatarError) {
+                        console.error('[Profile] Failed to save collector avatar:', avatarError);
+                        Sentry.captureException(avatarError);
+                        Alert.alert('Error', 'Could not save your new photo. Please try again.');
+                        return;
+                      }
                       setCollectorProfile({ ...collectorProfile, photo: url });
                       setUserProfile((prev: any) => ({ ...prev, avatar_url: url }));
-                      await supabase.from('profiles').update({ avatar_url: url }).eq('id', user?.id);
                     }
                   })}
                   style={{ position: 'relative' }}
@@ -6757,6 +6851,8 @@ export default function App() {
                       setSupportMessages([{ sender_id: 'bot', content: 'Hi! Welcome to Borla Collector Support. How can we help you today?' }]);
                       setStep(AppStep.CHAT);
                     } else {
+                      console.error('[Support] Could not create collector support ticket:', error);
+                      Sentry.captureException(error);
                       Alert.alert('Error', 'Could not open support chat. Please try again.');
                     }
                   }}
@@ -6782,6 +6878,8 @@ export default function App() {
                     if (ticket) {
                       Alert.alert('Ticket Raised ✅', `Your support ticket #${ticket.id.slice(0,8)} has been created. We will contact you shortly.`);
                     } else {
+                      console.error('[Support] Could not raise ticket:', error);
+                      Sentry.captureException(error);
                       Alert.alert('Error', 'Could not raise a ticket. Please try again.');
                     }
                   }}
@@ -7314,31 +7412,41 @@ export default function App() {
                       onPress={() => pickImage(async (uri, base64) => {
                         const url = await uploadToSupabase(uri, 'collector-documents', `${user?.id}/${doc.key}.jpg`, base64);
                         if (url) {
-                          const updatedDocs = { ...documents, [doc.key]: url };
-                          setDocuments(prev => ({ ...prev, [doc.key]: url }));
-                          // Also store in collector_documents table matching real schema
-                          const { data: existing } = await supabase.from('collector_documents').select('id').eq('collector_id', user?.id).eq('doc_type', doc.key).maybeSingle();
-                          if (existing) {
-                            await supabase.from('collector_documents').update({
-                              doc_url: url,
-                              status: 'pending'
-                            }).eq('id', existing.id);
-                          } else {
-                            await supabase.from('collector_documents').insert({
-                              collector_id: user?.id,
-                              doc_type: doc.key,
-                              doc_url: url,
-                              status: 'pending'
-                            });
-                          }
-                          // Update profiles.vehicle_details.kyc_docs to ensure 100% reliable read access for Admin
-                          const currentVehicleDetails = userProfile?.vehicle_details || vehicleDetails || {};
-                          await supabase.from('profiles').update({
-                            vehicle_details: {
-                              ...currentVehicleDetails,
-                              kyc_docs: updatedDocs
+                          try {
+                            const updatedDocs = { ...documents, [doc.key]: url };
+                            // Also store in collector_documents table matching real schema
+                            const { data: existing } = await supabase.from('collector_documents').select('id').eq('collector_id', user?.id).eq('doc_type', doc.key).maybeSingle();
+                            if (existing) {
+                              const { error: updateDocError } = await supabase.from('collector_documents').update({
+                                doc_url: url,
+                                status: 'pending'
+                              }).eq('id', existing.id);
+                              if (updateDocError) throw updateDocError;
+                            } else {
+                              const { error: insertDocError } = await supabase.from('collector_documents').insert({
+                                collector_id: user?.id,
+                                doc_type: doc.key,
+                                doc_url: url,
+                                status: 'pending'
+                              });
+                              if (insertDocError) throw insertDocError;
                             }
-                          }).eq('id', user?.id);
+                            // Update profiles.vehicle_details.kyc_docs to ensure 100% reliable read access for Admin
+                            const currentVehicleDetails = userProfile?.vehicle_details || vehicleDetails || {};
+                            const { error: vehicleDetailsError } = await supabase.from('profiles').update({
+                              vehicle_details: {
+                                ...currentVehicleDetails,
+                                kyc_docs: updatedDocs
+                              }
+                            }).eq('id', user?.id);
+                            if (vehicleDetailsError) throw vehicleDetailsError;
+
+                            setDocuments(prev => ({ ...prev, [doc.key]: url }));
+                          } catch (docErr) {
+                            console.error('[KYC] Failed to save document:', docErr);
+                            Sentry.captureException(docErr);
+                            Alert.alert('Upload Failed', `Could not save your ${doc.label}. Please try again — this document won't be reviewed until it saves successfully.`);
+                          }
                         }
                       })}
                       style={[styles.phoneInput, { marginTop: 8, padding: 16, alignItems: 'center' }]}
@@ -7504,6 +7612,7 @@ export default function App() {
                       throw error;
                     }
                   } catch (e: any) {
+                    Sentry.captureException(e);
                     Alert.alert('Error', 'Failed to upload proof: ' + e.message);
                   } finally {
                     setIsSubmittingProof(false);
@@ -7569,6 +7678,7 @@ export default function App() {
                     const result = await analyzeTrashImage(base64);
                     setAiResult(result);
                   } catch (err: any) {
+                    Sentry.captureException(err);
                     console.error('AI estimator error:', err);
                     setAiError('Could not analyze the image. Please try again.');
                   } finally {
@@ -7660,6 +7770,7 @@ export default function App() {
                             }
                             setStep(AppStep.BOOKING);
                           } catch (e) {
+                            Sentry.captureException(e);
                             Alert.alert("Error", "Could not verify collector availability. Please try again.");
                           } finally {
                             setIsBookingFromEstimate(false);
@@ -7735,7 +7846,11 @@ export default function App() {
                       return;
                     }
                     // Auto-join creator as first member
-                    await supabase.from('community_pool_members').insert({ pool_id: pool.id, profile_id: user?.id });
+                    const { error: joinError } = await supabase.from('community_pool_members').insert({ pool_id: pool.id, profile_id: user?.id });
+                    if (joinError) {
+                      console.error('[Pools] Failed to auto-join creator to new pool:', joinError);
+                      Sentry.captureException(joinError);
+                    }
                     setNewPoolName('');
                     setIsCreatingPool(false);
                     Alert.alert('Pool Created! 🎉', `"${pool.name}" is live. Share it with your neighbors so they can join!`);
@@ -7771,7 +7886,11 @@ export default function App() {
                     if (error) {
                       Alert.alert('Already Joined', 'You are already a member of this pool.');
                     } else {
-                      await supabase.from('community_pools').update({ current_members: (pool.current_members || 0) + 1 }).eq('id', pool.id);
+                      const { error: countError } = await supabase.from('community_pools').update({ current_members: (pool.current_members || 0) + 1 }).eq('id', pool.id);
+                      if (countError) {
+                        console.error('[Pools] Failed to update pool member count:', countError);
+                        Sentry.captureException(countError);
+                      }
                       Alert.alert('Welcome! 🎉', 'You have joined the pool. You will be notified when it fills up.');
                       fetchCommunityPools();
                     }
@@ -8148,6 +8267,7 @@ export default function App() {
                       }
                     });
                   } catch (e) {
+                    Sentry.captureException(e);
                     console.log('Rating submit error:', e);
                   } finally {
                     setIsSubmittingRating(false);
@@ -8214,6 +8334,7 @@ export default function App() {
                           Alert.alert('Not Found', 'Could not find that location. Try a more specific search.');
                         }
                       } catch (e) {
+                        Sentry.captureException(e);
                         Alert.alert('Error', 'Connection failed. Please try again.');
                       } finally {
                         setIsSearchingLocation(false);

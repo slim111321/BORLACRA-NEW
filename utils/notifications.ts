@@ -96,29 +96,24 @@ export async function schedulePredictiveReminder(daysFromNow: number = 4) {
 }
 
 /**
- * Simulate pushing a notification to a specific user (In production this is done securely via backend/Edge Function sending to Expo Servers)
- * @param token The Expo Push Token
+ * Send a push notification to a user via the `send-push-notification` edge
+ * function, given their user id -- not their raw Expo push token. Sending
+ * (and resolving the recipient's token) happens entirely server-side now;
+ * the client never reads or transmits another user's push token, so a
+ * client can no longer send arbitrary notification content to anyone
+ * whose token it happens to have.
+ * @param recipientUserId The recipient's profiles.id
  * @param title Notification Title
  * @param body Notification Body
+ * @param data Optional extra payload data
  */
-export async function sendPushNotification(token: string, title: string, body: string) {
-  const message = {
-    to: token,
-    sound: 'default',
-    title,
-    body,
-    data: { someData: 'goes here' },
-  };
-
-  await fetch('https://exp.host/--/api/v2/push/send', {
-    method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      'Accept-encoding': 'gzip, deflate',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(message),
+export async function sendPushNotification(recipientUserId: string, title: string, body: string, data?: Record<string, unknown>) {
+  const { error } = await supabase.functions.invoke('send-push-notification', {
+    body: { recipientUserId, title, body, data },
   });
+  if (error) {
+    console.error('[Push] Failed to send notification:', error);
+  }
 }
 
 /**
@@ -159,25 +154,21 @@ export async function checkAndNotifyMissedBookings(collectorId: string, collecto
       matchFound = true;
       
       // 1. Mark as resolved so we don't spam them again
-      await supabase.from('missed_bookings').update({ 
+      const { error: resolveError } = await supabase.from('missed_bookings').update({
         resolved: true,
-        resolved_by: collectorId 
+        resolved_by: collectorId
       }).eq('id', booking.id);
-
-      // 2. Fetch the customer's push token explicitly
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('push_token')
-        .eq('id', booking.user_id)
-        .single();
-
-      if (profile?.push_token) {
-        await sendPushNotification(
-          profile.push_token,
-          '🚛 Good news!',
-          'A collector is now in your area. Tap to open the app and schedule your pickup before they leave!'
-        );
+      if (resolveError) {
+        console.error('[MissedBookings] Failed to mark resolved:', resolveError);
       }
+
+      // 2. Notify the customer -- the edge function resolves their push
+      // token itself server-side, we only ever pass their user id.
+      await sendPushNotification(
+        booking.user_id,
+        '🚛 Good news!',
+        'A collector is now in your area. Tap to open the app and schedule your pickup before they leave!'
+      );
     }
   }
 

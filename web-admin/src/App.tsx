@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
+import * as Sentry from '@sentry/react';
 import { supabase } from './lib/supabase';
 import LiveMap from './components/LiveMap';
 import MapboxLiveMap from './components/MapboxLiveMap';
@@ -156,6 +157,7 @@ function App() {
         oscillator.stop(startTime + 0.2);
       });
     } catch (e) {
+      Sentry.captureException(e, { level: 'warning' });
       console.warn("Audio play failed:", e);
     }
   };
@@ -214,6 +216,7 @@ function App() {
           }
         }
       } catch (e) {
+        Sentry.captureException(e);
         console.error('Error generating signed url', e);
       }
       return doc; // fallback to original if failed
@@ -235,6 +238,7 @@ function App() {
           }
         }
       } catch (e) {
+        Sentry.captureException(e);
         console.error('Error generating signed url for vehicle', e);
       }
     }
@@ -294,6 +298,7 @@ function App() {
         setError('Access Denied: You do not have administrator privileges.');
       }
     } catch (err) {
+      Sentry.captureException(err);
       setError('Could not verify your access level.');
     } finally {
       setLoading(false);
@@ -335,6 +340,7 @@ function App() {
         unmetDemandCount7d: unmetCount || 0
       });
     } catch (err) {
+      Sentry.captureException(err);
       console.error('fetchAdminOverview error:', err);
     }
   }, []);
@@ -351,6 +357,7 @@ function App() {
       if (lf) setLandfills(lf);
       if (fleet) setFleetStatus(fleet);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Logistics fetch error:", err);
     }
   }, [fleetFilter]);
@@ -382,6 +389,7 @@ function App() {
       }
       if (refunds) setRefundRequests(refunds);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Finance fetch error:", err);
     }
   }, []);
@@ -398,6 +406,7 @@ function App() {
       if (users) setPlatformUsers(users);
       if (docs) setKycFiles(docs);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("User fetch error:", err);
     }
   }, []);
@@ -418,6 +427,7 @@ function App() {
       if (locs) setCollectorLocations(locs);
       if (picks) setActivePickups(picks);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("LiveOps fetch error:", err);
     }
   }, []);
@@ -444,6 +454,7 @@ function App() {
 
       setHeatmapData(points || []);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Heatmap fetch error:", err);
     }
   }, [heatmapTimeRange]);
@@ -465,6 +476,7 @@ function App() {
 
       setUnmetDemandData((data || []).map(p => ({ latitude: p.latitude, longitude: p.longitude, intensity: 0.7 })));
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Unmet demand fetch error:", err);
     }
   }, []);
@@ -550,6 +562,7 @@ function App() {
       setLowRatings(enrichedReviews);
       if (metrics) setCollectorMetrics(metrics);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Performance fetch error:", err);
     }
   }, []);
@@ -560,6 +573,7 @@ function App() {
       if (error) throw error;
       setLandfills(data || []);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Landfills fetch error:", err);
     }
   }, []);
@@ -582,6 +596,7 @@ function App() {
       if (error) throw error;
       setIncidentReports(data || []);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Incidents fetch error:", err);
     }
   }, []);
@@ -615,6 +630,7 @@ function App() {
 
       setSupportTickets(enrichedTickets);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Support fetch error:", err);
     }
   }, []);
@@ -702,6 +718,7 @@ function App() {
 
       return ticket;
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Open chat error details:", err);
       const msg = (err as any).message || "Unknown error";
       alert("Could not open chat: " + msg);
@@ -754,6 +771,7 @@ function App() {
         });
       }
     } catch (err) {
+      Sentry.captureException(err);
       alert("Error sending message: " + (err as Error).message);
     }
   };
@@ -870,6 +888,7 @@ function App() {
           const result = await activeMapProvider.reverseGeocode({ latitude: row.latitude, longitude: row.longitude });
           if (result) label = result.label;
         } catch (e) {
+          Sentry.captureException(e);
           console.error('[AdminAlert] Reverse geocode failed for unmet demand toast:', e);
         }
         const toastId = row.id;
@@ -900,6 +919,7 @@ function App() {
       if (dist) setTrashDistribution(dist);
       if (ranking) setTopCollectors(ranking);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Intelligence fetch error:", err);
     }
   }, []);
@@ -909,6 +929,7 @@ function App() {
       const { data: bHistory } = await supabase.from('broadcasts').select('*').order('created_at', { ascending: false });
       if (bHistory) setBroadcastHistory(bHistory);
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Broadcast fetch error:", err);
     }
   }, []);
@@ -987,6 +1008,7 @@ function App() {
       if (error) throw error;
       fetchLandfills();
     } catch (err) {
+      Sentry.captureException(err);
       console.error("Landfill update error:", err);
     }
   }, [fetchLandfills]);
@@ -997,6 +1019,7 @@ function App() {
       if (error) throw error;
       fetchIncidents();
     } catch (err) {
+      Sentry.captureException(err);
       alert("Error updating incident status");
     }
   }, [fetchIncidents]);
@@ -1019,6 +1042,7 @@ function App() {
       
       alert('Collector verified successfully!');
     } catch (err: any) {
+      Sentry.captureException(err);
       alert('Approval failed: ' + err.message);
     }
   };
@@ -1044,6 +1068,7 @@ function App() {
       fetchUserData();
       alert(isCurrentlySuspended ? 'User reactivated.' : 'User suspended.');
     } catch (err: any) {
+      Sentry.captureException(err);
       alert('Failed to update user status: ' + err.message);
     }
   };
@@ -1064,6 +1089,7 @@ function App() {
       }
       fetchFinanceData();
     } catch (err: any) {
+      Sentry.captureException(err);
       alert('Operation failed: ' + err.message);
     }
   };
@@ -1089,6 +1115,7 @@ function App() {
       setNewAnnouncement('');
       fetchBroadcastData();
     } catch (err: any) {
+      Sentry.captureException(err);
       alert('Failed to broadcast: ' + err.message);
     }
   };

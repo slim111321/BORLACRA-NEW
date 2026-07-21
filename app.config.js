@@ -67,6 +67,14 @@ module.exports = {
           RNMapboxMapsDownloadToken: process.env.RNMAPBOX_DOWNLOAD_TOKEN,
         },
       ],
+      // Crash/error reporting (see lib/sentry.ts for the runtime Sentry.init
+      // call). This plugin only wires up the native build-phase scripts for
+      // uploading source maps/dSYMs so stack traces are readable — that
+      // upload step needs SENTRY_AUTH_TOKEN, SENTRY_ORG and SENTRY_PROJECT
+      // set as EAS secrets (same pattern as RNMAPBOX_DOWNLOAD_TOKEN above).
+      // Without those, crash reporting still works, just with unminified
+      // traces.
+      '@sentry/react-native',
     ],
     extra: {
       eas: {

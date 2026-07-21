@@ -6,3 +6,7 @@
 .env.keys
 .env.local
 .env.*.local
+
+# Local secrets for `supabase functions serve` (real provider API keys —
+# see .env.local.example for what these are and where the values live)
+functions/.env

@@ -1,51 +1,30 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
-
-const GEMINI_API_KEY = process.env.EXPO_PUBLIC_GEMINI_API_KEY || '';
+import { supabase } from './supabase';
 
 /**
- * Transcribe audio to text using Gemini API
- * Supports both English and Twi (Ghanaian language)
+ * Transcribe audio to text via the `voice-transcribe` Supabase edge
+ * function. Supports both English and Twi (Ghanaian language).
+ *
+ * The actual Gemini call (and EXPO_PUBLIC_GEMINI_API_KEY) used to live
+ * directly in this file, shipping the key inside the compiled app. It now
+ * lives server-side in the edge function, which requires a signed-in user
+ * and enforces a daily per-user quota -- see
+ * supabase/migrations/20260721000000_ai_proxy_rate_limit.sql.
  */
 export async function transcribeVoiceMessage(
     audioBase64: string,
     mimeType: string = 'audio/webm'
 ): Promise<{ text: string; language: 'en' | 'tw'; error?: string }> {
     try {
-        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest' });
+        const { data, error } = await supabase.functions.invoke('voice-transcribe', {
+            body: { audioBase64, mimeType },
+        });
 
-        const prompt = `Transcribe this voice message. The speaker may be speaking in English or Twi (Ghanaian language). 
-    
-Instructions:
-1. Transcribe exactly what is said
-2. If the language is Twi, provide the transcription in Twi
-3. Identify the language used (English or Twi)
-4. Return in this format:
-   Language: [English/Twi]
-   Transcription: [exact words spoken]`;
-
-        const result = await model.generateContent([
-            {
-                inlineData: {
-                    data: audioBase64,
-                    mimeType: mimeType,
-                },
-            },
-            prompt,
-        ]);
-
-        const response = result.response.text();
-
-        // Parse the response
-        const languageMatch = response.match(/Language:\s*(English|Twi)/i);
-        const transcriptionMatch = response.match(/Transcription:\s*(.+)/i);
-
-        const language = languageMatch?.[1].toLowerCase() === 'twi' ? 'tw' : 'en';
-        const text = transcriptionMatch?.[1]?.trim() || response;
+        if (error) throw error;
 
         return {
-            text,
-            language,
+            text: data?.text || '',
+            language: data?.language === 'tw' ? 'tw' : 'en',
+            error: data?.error,
         };
     } catch (error: any) {
         console.error('Voice transcription error:', error);

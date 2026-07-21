@@ -2,5 +2,21 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": true
-  }
+  },
+  "include": [
+    "App.tsx",
+    "index.tsx",
+    "constants.ts",
+    "types.ts",
+    "components/**/*",
+    "utils/**/*",
+    "services/**/*",
+    "lib/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "web-admin",
+    "scratch",
+    "supabase/functions"
+  ]
 }
