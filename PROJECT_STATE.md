@@ -23,12 +23,11 @@ before touching the backend — they contain a detailed history of prior
 security fixes (the "BC-NNN" series) with the same rigor this session
 continued.
 
-**Important asymmetry right now**: the live Supabase project (migrations,
-edge functions, secrets) is already updated per this session's changes.
-The corresponding code in this git working tree is **uncommitted** (see
-`git status`). If this working tree were lost before committing, the live
-DB schema would drift out of sync with what's tracked in git. Commit these
-changes before doing anything else risky.
+All of this session's changes are committed and pushed: `master` is at
+`3906980` ("Production-readiness pass: critical RLS fixes, server-side
+AI/push proxies, monitoring, CI"), matching `origin/master`. The live
+Supabase project (migrations, edge functions, secrets) and this repo are
+in sync — no outstanding drift.
 
 ## Session context
 
